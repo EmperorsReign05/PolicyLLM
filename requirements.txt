@@ -5,3 +5,5 @@ sentence-transformers
 faiss-cpu
 langchain-google-genai
 python-dotenv
+langchain-huggingface
+streamlit
