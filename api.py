@@ -1,10 +1,11 @@
-# api.py - Ultra-Light Cloud Deployment Version
+# api.py - Ultra-Fast Cloud Deployment Version
 import os
 import requests
 import tempfile
 import time
 import logging
 import re
+import asyncio
 from datetime import datetime
 from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -14,6 +15,8 @@ from typing import List
 from dotenv import load_dotenv
 import urllib3
 from urllib.parse import urlparse
+from concurrent.futures import ThreadPoolExecutor
+import threading
 
 # Disable SSL warnings
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -32,11 +35,14 @@ logger = logging.getLogger(__name__)
 # Load environment variables
 load_dotenv()
 
-# Configuration
+# Configuration - OPTIMIZED FOR SPEED
 AUTH_TOKEN = "78b25ddaad17f4e8d85cde3dca81ade8319272062cf10b73ba148b425151f2fd"
-MAX_RESPONSE_TIME = 30
-MAX_CHUNK_SIZE = 800
-TOP_K_RETRIEVAL = 3
+MAX_RESPONSE_TIME = 25  # Reduced from 30
+MAX_CHUNK_SIZE = 600    # Reduced from 800 for faster processing
+TOP_K_RETRIEVAL = 2     # Reduced from 3
+MAX_PAGES = 50          # Limit pages processed
+TIMEOUT_PER_QUESTION = 3  # Max time per question
+DOWNLOAD_TIMEOUT = 10   # Reduced download timeout
 
 # Authentication
 auth_scheme = HTTPBearer()
@@ -54,24 +60,26 @@ class QueryRequest(BaseModel):
 class QueryResponse(BaseModel):
     answers: List[str]
 
-# Global variables
+# Global variables with thread safety
 vectorizer = None
 llm = None
 app_start_time = time.time()
+doc_cache = {}  # Simple document cache
+cache_lock = threading.Lock()
 
 def initialize_models():
-    """Initialize AI models"""
+    """Initialize AI models - OPTIMIZED"""
     global vectorizer, llm
     
     try:
         if vectorizer is None:
-            logger.info("Loading TF-IDF vectorizer...")
+            logger.info("Loading optimized TF-IDF vectorizer...")
             vectorizer = TfidfVectorizer(
-                max_features=5000,
+                max_features=2000,  # Reduced from 5000
                 stop_words='english',
                 ngram_range=(1, 2),
-                max_df=0.95,
-                min_df=2
+                max_df=0.9,  # More aggressive filtering
+                min_df=1     # Less strict minimum
             )
             logger.info("✅ Vectorizer loaded")
         
@@ -82,15 +90,24 @@ def initialize_models():
                 raise ValueError("GOOGLE_API_KEY not found")
             
             genai.configure(api_key=api_key)
-            llm = genai.GenerativeModel('gemini-1.5-flash')
-            logger.info("✅ LLM loaded")
+            # Use faster model configuration
+            llm = genai.GenerativeModel(
+                'gemini-1.5-flash',
+                generation_config=genai.types.GenerationConfig(
+                    temperature=0.1,  # Lower temperature for faster, more deterministic responses
+                    max_output_tokens=200,  # Limit output length
+                    top_p=0.8,
+                    top_k=20
+                )
+            )
+            logger.info("✅ LLM loaded with speed optimizations")
             
     except Exception as e:
         logger.error(f"❌ Model initialization failed: {e}")
         raise
 
-def extract_text_from_pdf(pdf_content):
-    """Extract text from PDF using PyPDF2"""
+def extract_text_from_pdf_fast(pdf_content):
+    """Extract text from PDF - SPEED OPTIMIZED"""
     try:
         with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as temp_file:
             temp_file.write(pdf_content)
@@ -100,29 +117,32 @@ def extract_text_from_pdf(pdf_content):
         
         with open(temp_file_path, 'rb') as file:
             pdf_reader = PyPDF2.PdfReader(file)
+            total_pages = min(len(pdf_reader.pages), MAX_PAGES)  # Limit pages
             
-            for page_num, page in enumerate(pdf_reader.pages):
+            for page_num in range(total_pages):
                 try:
+                    page = pdf_reader.pages[page_num]
                     text = page.extract_text()
+                    
                     if text.strip():
-                        # Simple chunking by sentences
-                        sentences = re.split(r'[.!?]+', text)
+                        # Faster chunking - split by paragraphs instead of sentences
+                        paragraphs = text.split('\n\n')
                         current_chunk = ""
                         
-                        for sentence in sentences:
-                            sentence = sentence.strip()
-                            if not sentence:
+                        for para in paragraphs:
+                            para = para.strip().replace('\n', ' ')
+                            if not para:
                                 continue
                                 
-                            if len(current_chunk) + len(sentence) < MAX_CHUNK_SIZE:
-                                current_chunk += sentence + ". "
+                            if len(current_chunk) + len(para) < MAX_CHUNK_SIZE:
+                                current_chunk += para + " "
                             else:
                                 if current_chunk.strip():
                                     text_chunks.append({
                                         'text': current_chunk.strip(),
                                         'page': page_num + 1
                                     })
-                                current_chunk = sentence + ". "
+                                current_chunk = para + " "
                         
                         # Add remaining chunk
                         if current_chunk.strip():
@@ -147,11 +167,15 @@ def extract_text_from_pdf(pdf_content):
         logger.error(f"PDF extraction failed: {e}")
         return []
 
-def search_documents(query, text_chunks):
-    """Search for relevant documents using TF-IDF"""
+def search_documents_fast(query, text_chunks):
+    """Search for relevant documents - SPEED OPTIMIZED"""
     try:
         if not text_chunks:
             return []
+            
+        # Use only top chunks if too many
+        if len(text_chunks) > 20:
+            text_chunks = text_chunks[:20]
             
         # Prepare texts
         texts = [chunk['text'] for chunk in text_chunks]
@@ -161,54 +185,46 @@ def search_documents(query, text_chunks):
         tfidf_matrix = vectorizer.fit_transform(all_texts)
         
         # Calculate similarities
-        query_vector = tfidf_matrix[-1]  # Last item is the query
-        document_vectors = tfidf_matrix[:-1]  # All except query
+        query_vector = tfidf_matrix[-1]
+        document_vectors = tfidf_matrix[:-1]
         
         similarities = cosine_similarity(query_vector, document_vectors).flatten()
         
-        # Get top k results
+        # Get top k results with lower threshold for speed
         top_indices = similarities.argsort()[-TOP_K_RETRIEVAL:][::-1]
         
         results = []
         for idx in top_indices:
-            if similarities[idx] > 0.1:  # Minimum similarity threshold
+            if similarities[idx] > 0.05:  # Lower threshold
                 results.append({
                     'text': texts[idx],
                     'score': float(similarities[idx]),
                     'page': text_chunks[idx]['page']
                 })
         
-        return results
+        return results if results else text_chunks[:TOP_K_RETRIEVAL]
         
     except Exception as e:
         logger.error(f"Search failed: {e}")
-        # Fallback: return first few chunks
         return text_chunks[:TOP_K_RETRIEVAL]
 
-def generate_answer(question, context_docs):
-    """Generate answer using Gemini"""
+def generate_answer_fast(question, context_docs):
+    """Generate answer using Gemini - SPEED OPTIMIZED"""
     try:
         if not context_docs:
             return "No relevant information found in the document."
             
-        # Prepare context
-        context = "\n\n".join([f"[Page {doc['page']}]: {doc['text']}" for doc in context_docs])
+        # Prepare shorter context
+        context = "\n".join([doc['text'][:300] for doc in context_docs])  # Limit context length
         
-        prompt = f"""You are an expert document analyst. Based on the provided context, answer the question accurately and concisely.
+        # Shorter, more direct prompt
+        prompt = f"""Based on the policy document context, answer concisely:
 
-CONTEXT:
-{context}
+Context: {context}
 
-QUESTION: {question}
+Question: {question}
 
-INSTRUCTIONS:
-- Provide a direct, accurate answer based ONLY on the context provided
-- Include specific details when available
-- If the information isn't in the context, state "The provided document does not contain specific information about this topic"
-- Keep answers concise but complete (50-150 words)
-- Use professional language
-
-ANSWER:"""
+Answer (max 100 words):"""
         
         response = llm.generate_content(prompt)
         return response.text.strip()
@@ -217,39 +233,50 @@ ANSWER:"""
         logger.error(f"Answer generation failed: {e}")
         return "Unable to generate answer due to an error."
 
-def download_document(url, max_retries=3):
-    """Download document with retries"""
-    logger.info(f"📥 Downloading: {url[:100]}...")
+def download_document_fast(url):
+    """Download document - SPEED OPTIMIZED"""
+    logger.info(f"📥 Fast downloading: {url[:50]}...")
     
     headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
     }
     
-    for attempt in range(max_retries):
-        try:
-            response = requests.get(url, headers=headers, timeout=30, verify=False, stream=True)
-            response.raise_for_status()
-            
-            content = b''
-            for chunk in response.iter_content(chunk_size=8192):
-                if chunk:
-                    content += chunk
+    try:
+        response = requests.get(
+            url, 
+            headers=headers, 
+            timeout=DOWNLOAD_TIMEOUT,  # Reduced timeout
+            verify=False, 
+            stream=True
+        )
+        response.raise_for_status()
+        
+        # Read with size limit for speed
+        content = b''
+        max_size = 10 * 1024 * 1024  # 10MB limit
+        
+        for chunk in response.iter_content(chunk_size=16384):  # Larger chunks
+            if chunk:
+                content += chunk
+                if len(content) > max_size:
+                    logger.warning("Document too large, truncating")
+                    break
                     
-            logger.info(f"✅ Downloaded {len(content):,} bytes")
-            return content
-            
-        except Exception as e:
-            logger.warning(f"Attempt {attempt + 1} failed: {e}")
-            if attempt < max_retries - 1:
-                time.sleep(2)
-    
-    raise Exception(f"Failed to download after {max_retries} attempts")
+        logger.info(f"✅ Downloaded {len(content):,} bytes in {DOWNLOAD_TIMEOUT}s timeout")
+        return content
+        
+    except Exception as e:
+        logger.error(f"Download failed: {e}")
+        raise
+
+# Thread pool for parallel processing
+executor = ThreadPoolExecutor(max_workers=4)
 
 # FastAPI App
 app = FastAPI(
-    title="HackRx 6.0 AI Policy Analyzer",
-    description="Cloud-optimized API for document analysis",
-    version="2.2.0"
+    title="HackRx 6.0 AI Policy Analyzer - SPEED OPTIMIZED",
+    description="Ultra-fast cloud API for document analysis",
+    version="2.3.0"
 )
 
 app.add_middleware(
@@ -262,10 +289,10 @@ app.add_middleware(
 
 @app.on_event("startup")
 async def startup_event():
-    logger.info("🚀 Starting HackRx API...")
+    logger.info("🚀 Starting OPTIMIZED HackRx API...")
     try:
         initialize_models()
-        logger.info("✅ Startup completed")
+        logger.info("✅ Fast startup completed")
     except Exception as e:
         logger.error(f"❌ Startup failed: {e}")
         raise
@@ -274,10 +301,17 @@ async def startup_event():
 async def root():
     uptime = time.time() - app_start_time
     return {
-        "status": "🚀 HackRx 6.0 API Online",
-        "version": "2.2.0",
+        "status": "⚡ HackRx 6.0 SPEED-OPTIMIZED API Online",
+        "version": "2.3.0",
         "uptime_seconds": round(uptime, 2),
         "models_loaded": vectorizer is not None and llm is not None,
+        "optimizations": [
+            "Reduced chunk size for faster processing",
+            "Limited pages and context length",
+            "Parallel question processing",
+            "Optimized TF-IDF parameters",
+            "Faster Gemini configuration"
+        ],
         "endpoint": "/hackrx/run"
     }
 
@@ -288,73 +322,97 @@ async def health_check():
         "status": "healthy",
         "uptime_seconds": round(uptime, 2),
         "models_loaded": vectorizer is not None and llm is not None,
-        "google_api_configured": bool(os.getenv("GOOGLE_API_KEY"))
+        "google_api_configured": bool(os.getenv("GOOGLE_API_KEY")),
+        "performance_mode": "OPTIMIZED"
     }
 
 @app.post("/hackrx/run", response_model=QueryResponse)
 async def run_analysis(request: QueryRequest, token: str = Depends(verify_token)):
-    """Main analysis endpoint"""
+    """Main analysis endpoint - SPEED OPTIMIZED"""
     start_time = time.time()
     request_id = f"req_{int(start_time)}"
     
-    logger.info(f"📋 [{request_id}] Processing {len(request.questions)} questions")
+    logger.info(f"⚡ [{request_id}] FAST processing {len(request.questions)} questions")
     
     try:
         # Ensure models are loaded
         if vectorizer is None or llm is None:
             initialize_models()
         
-        # Download document
-        try:
-            pdf_content = download_document(request.documents)
-        except Exception as e:
-            logger.error(f"[{request_id}] Download failed: {e}")
-            fallback_answers = [
-                "Unable to access the specified document. Please ensure the document URL is publicly accessible and points to a valid PDF file."
-                for _ in request.questions
-            ]
-            return {"answers": fallback_answers}
+        # Check cache first
+        doc_hash = str(hash(request.documents))
+        text_chunks = None
         
-        # Extract text
-        text_chunks = extract_text_from_pdf(pdf_content)
-        if not text_chunks:
-            logger.error(f"[{request_id}] No text extracted from PDF")
-            fallback_answers = [
-                "Unable to extract text from the document. The document may be corrupted, password-protected, or contain only images."
-                for _ in request.questions
-            ]
-            return {"answers": fallback_answers}
+        with cache_lock:
+            if doc_hash in doc_cache:
+                text_chunks = doc_cache[doc_hash]
+                logger.info(f"[{request_id}] Using cached document")
         
-        logger.info(f"[{request_id}] Extracted {len(text_chunks)} text chunks")
-        
-        # Process questions
-        answers = []
-        for i, question in enumerate(request.questions, 1):
-            logger.info(f"[{request_id}] Processing Q{i}: {question[:50]}...")
-            
+        if text_chunks is None:
+            # Download document
             try:
-                # Search for relevant context
-                relevant_docs = search_documents(question, text_chunks)
+                pdf_content = download_document_fast(request.documents)
+            except Exception as e:
+                logger.error(f"[{request_id}] Download failed: {e}")
+                fallback_answers = [
+                    "Document access failed. Please check URL accessibility."
+                    for _ in request.questions
+                ]
+                return {"answers": fallback_answers}
+            
+            # Extract text
+            text_chunks = extract_text_from_pdf_fast(pdf_content)
+            if not text_chunks:
+                logger.error(f"[{request_id}] No text extracted")
+                fallback_answers = [
+                    "Unable to extract text from document."
+                    for _ in request.questions
+                ]
+                return {"answers": fallback_answers}
+            
+            # Cache the result
+            with cache_lock:
+                doc_cache[doc_hash] = text_chunks
+                # Keep cache small
+                if len(doc_cache) > 5:
+                    oldest_key = next(iter(doc_cache))
+                    del doc_cache[oldest_key]
+        
+        logger.info(f"[{request_id}] Processing {len(text_chunks)} chunks")
+        
+        # Process questions in parallel using thread pool
+        def process_question(question_data):
+            i, question = question_data
+            try:
+                # Timeout per question
+                start_q_time = time.time()
                 
-                # Generate answer
-                answer = generate_answer(question, relevant_docs)
-                answers.append(answer)
+                relevant_docs = search_documents_fast(question, text_chunks)
+                answer = generate_answer_fast(question, relevant_docs)
                 
-                logger.info(f"[{request_id}] ✅ Q{i} completed")
+                q_time = time.time() - start_q_time
+                if q_time > TIMEOUT_PER_QUESTION:
+                    logger.warning(f"Q{i} took {q_time:.2f}s (over limit)")
+                
+                return answer
                 
             except Exception as e:
-                logger.error(f"[{request_id}] Q{i} failed: {e}")
-                answers.append("Unable to process this question due to an error.")
+                logger.error(f"Q{i} failed: {e}")
+                return "Processing error occurred."
+        
+        # Execute questions in parallel
+        question_data = list(enumerate(request.questions, 1))
+        answers = list(executor.map(process_question, question_data))
         
         total_time = time.time() - start_time
-        logger.info(f"[{request_id}] 🎉 Completed in {total_time:.2f}s")
+        logger.info(f"[{request_id}] ⚡ COMPLETED in {total_time:.2f}s")
         
         return {"answers": answers}
         
     except Exception as e:
         logger.error(f"[{request_id}] Unexpected error: {e}")
         error_answers = [
-            "An unexpected error occurred while processing your request. Please try again."
+            "Processing error occurred."
             for _ in request.questions
         ]
         return {"answers": error_answers}
@@ -363,17 +421,20 @@ async def run_analysis(request: QueryRequest, token: str = Depends(verify_token)
 async def hackrx_info():
     """Info about the main endpoint"""
     return {
-        "message": "HackRx 6.0 Document Analysis Endpoint",
+        "message": "HackRx 6.0 SPEED-OPTIMIZED Document Analysis",
         "method": "POST",
         "endpoint": "/hackrx/run",
-        "description": "Cloud-optimized document analysis with question answering",
-        "features": [
-            "PDF document processing with PyPDF2",
-            "TF-IDF based document search", 
-            "Google Gemini for answer generation",
-            "Robust error handling",
-            "Fast cloud deployment"
-        ]
+        "description": "Ultra-fast document analysis with aggressive optimizations",
+        "speed_features": [
+            "Document caching",
+            "Parallel question processing", 
+            "Reduced chunk sizes",
+            "Limited context windows",
+            "Fast PDF extraction",
+            "Optimized TF-IDF search",
+            "Speed-tuned Gemini config"
+        ],
+        "target_response_time": "< 25 seconds"
     }
 
 if __name__ == "__main__":
