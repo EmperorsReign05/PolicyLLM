@@ -1,5 +1,12 @@
 __pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
 .env
+.venv
+env/
+venv/
 *.pdf
 *.docx
 *.zip
@@ -9,3 +16,10 @@ __pycache__/
 .DS_Store
 .git/
 .gitignore
+README.md
+.pytest_cache/
+.coverage
+.mypy_cache/
+*.log
+.railway/
+railway.json
