@@ -10,7 +10,7 @@ from typing import List
 from dotenv import load_dotenv
 
 # LangChain components for a robust RAG pipeline
-from langchain_community.document_loaders import PyMuPDFLoader
+from langchain_community.document_loaders import PyPDFLoader # <-- UPDATED IMPORT
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
@@ -26,7 +26,10 @@ auth_scheme = HTTPBearer()
 
 def verify_token(credentials: HTTPAuthorizationCredentials = Depends(auth_scheme)):
     if credentials.scheme != "Bearer" or credentials.credentials != AUTH_TOKEN:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid token",
+        )
 
 # --- Pydantic Models ---
 class QueryRequest(BaseModel):
@@ -52,37 +55,42 @@ prompt = PromptTemplate.from_template(
 def format_docs(docs):
     return "\n\n".join(doc.page_content for doc in docs)
 
-# --- FastAPI App ---
+# --- FastAPI Application ---
 app = FastAPI(title="HackRx 6.0 High-Performance Policy Analyzer")
 
 @app.post("/api/v1/hackrx/run", response_model=QueryResponse)
 async def run_analysis(request: QueryRequest, token: str = Depends(verify_token)):
     try:
-        # 1. Download and process the document to create a retriever
+        # 1. Download the document from the URL
         headers = {'User-Agent': 'Mozilla/5.0'}
         response = requests.get(request.documents, headers=headers)
         response.raise_for_status()
 
+        # 2. Process the document in-memory
         with tempfile.NamedTemporaryFile(delete=True, suffix=".pdf") as temp_file:
             temp_file.write(response.content)
-            loader = PyMuPDFLoader(temp_file.name)
+            temp_file_path = temp_file.name
+            
+            # --- UPDATED LOADER ---
+            loader = PyPDFLoader(temp_file_path)
+            # ----------------------
+            
             docs = loader.load_and_split(RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150))
             vectorstore = FAISS.from_documents(docs, embeddings)
             retriever = vectorstore.as_retriever()
 
-        # 2. Define the RAG chain for a single question
-        rag_chain_for_one_question = (
+        # 3. Create the RAG chain
+        rag_chain = (
             {"context": retriever | format_docs, "question": RunnablePassthrough()}
             | prompt
             | llm
             | StrOutputParser()
         )
 
-        # 3. Process all questions IN PARALLEL for speed
-        tasks = [rag_chain_for_one_question.ainvoke(q) for q in request.questions]
+        # 4. Loop through questions and get answers in parallel
+        tasks = [rag_chain.ainvoke(q) for q in request.questions]
         answers = await asyncio.gather(*tasks)
         
-        # Clean up answers
         cleaned_answers = [ans.strip() for ans in answers]
 
         return {"answers": cleaned_answers}
