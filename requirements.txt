@@ -1,4 +1,10 @@
 
+--index-url https://download.pytorch.org/whl/cpu
+torch
+torchvision
+torchaudio
+
+
 fastapi
 uvicorn[standard]
 python-dotenv
@@ -8,7 +14,6 @@ langchain-huggingface
 langchain-google-genai
 faiss-cpu
 sentence-transformers
-
 requests
 google-generativeai
 pydantic
