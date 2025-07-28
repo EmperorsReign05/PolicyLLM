@@ -3,11 +3,13 @@ uvicorn[standard]
 python-dotenv
 requests
 pydantic
-sentence-transformers==2.2.2
-faiss-cpu
 langchain
 langchain-community
 langchain-huggingface
 langchain-google-genai
 google-generativeai
+faiss-cpu
 PyMuPDF
+
+
+sentence-transformers==0.4.1.2

@@ -1,0 +1,11 @@
+__pycache__/
+.env
+*.pdf
+*.docx
+*.zip
+*.tar
+*.ipynb
+.vscode/
+.DS_Store
+.git/
+.gitignore
