@@ -1,3 +1,4 @@
+
 # api.py
 import os
 import fitz  # PyMuPDF
@@ -5,13 +6,14 @@ import requests
 import tempfile
 import asyncio
 import re
+import hashlib
+import json
 from typing import List, Dict, Any
 from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from dotenv import load_dotenv
 import google.generativeai as genai
-from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 import numpy as np
 
@@ -40,69 +42,93 @@ class QueryResponse(BaseModel):
 # --- Lightweight Text Processing ---
 class LightweightRAG:
     def __init__(self):
-        self.vectorizer = TfidfVectorizer(
-            max_features=5000,
-            stop_words='english',
-            ngram_range=(1, 2),
-            max_df=0.95,
-            min_df=2
-        )
-        self.model = genai.GenerativeModel('gemini-1.5-flash-latest')
-        
+        self.model = genai.GenerativeModel("gemini-1.5-flash-latest")
+    
     def clean_text(self, text: str) -> str:
-        """Clean and normalize text"""
-        text = re.sub(r'\s+', ' ', text)  # Multiple spaces to single
-        text = re.sub(r'[^\w\s\.\,\!\?\;\:\-\(\)]', '', text)  # Keep basic punctuation
+        text = re.sub(r"\s+", " ", text)
+        text = re.sub(r"[^\w\s\.\,\!\?\;\:\-\(\)]", "", text)
         return text.strip()
     
     def chunk_text(self, text: str, chunk_size: int = 1000, overlap: int = 150) -> List[str]:
-        """Split text into overlapping chunks"""
         words = text.split()
         chunks = []
-        
         for i in range(0, len(words), chunk_size - overlap):
-            chunk = ' '.join(words[i:i + chunk_size])
+            chunk = " ".join(words[i:i + chunk_size])
             if chunk.strip():
                 chunks.append(chunk)
-        
         return chunks
+
+    def _hash_text(self, text: str) -> str:
+        return hashlib.sha256(text.encode("utf-8")).hexdigest()
     
+    def save_embedding_cache(self, key: str, data: List[Dict[str, Any]], dir="embedding_cache"):
+        os.makedirs(dir, exist_ok=True)
+        path = os.path.join(dir, f"{key}.json")
+        with open(path, "w") as f:
+            json.dump(data, f)
+
+    def load_embedding_cache(self, key: str, dir="embedding_cache") -> List[Dict[str, Any]]:
+        path = os.path.join(dir, f"{key}.json")
+        if os.path.exists(path):
+            with open(path, "r") as f:
+                return json.load(f)
+        return []
+
     def retrieve_relevant_chunks(self, query: str, chunks: List[str], top_k: int = 3) -> List[str]:
-        """Retrieve most relevant chunks using TF-IDF"""
-        if not chunks:
-            return []
-            
+        cache_key = self._hash_text("".join(chunks))
+        cached = self.load_embedding_cache(cache_key)
+
+        if cached:
+            embedded_chunks = [np.array(item["embedding"]) for item in cached]
+            texts = [item["text"] for item in cached]
+        else:
+            embedded_chunks = []
+            texts = []
+            for chunk in chunks:
+                try:
+                    emb = self.model.embed_content(content=chunk, task_type="retrieval_document")["embedding"]
+                    embedded_chunks.append(np.array(emb))
+                    texts.append(chunk)
+                except Exception as e:
+                    print(f"Embedding failed: {e}")
+            self.save_embedding_cache(cache_key, [{"text": t, "embedding": e.tolist()} for t, e in zip(texts, embedded_chunks)])
+
         try:
-            # Fit vectorizer on chunks + query
-            all_texts = chunks + [query]
-            tfidf_matrix = self.vectorizer.fit_transform(all_texts)
-            
-            # Calculate similarity between query and chunks
-            query_vector = tfidf_matrix[-1]  # Last item is the query
-            chunk_vectors = tfidf_matrix[:-1]  # All except query
-            
-            similarities = cosine_similarity(query_vector, chunk_vectors).flatten()
-            
-            # Get top k chunks
-            top_indices = np.argsort(similarities)[-top_k:][::-1]
-            return [chunks[i] for i in top_indices if similarities[i] > 0.1]
-            
+            query_emb = np.array(self.model.embed_content(content=query, task_type="retrieval_query")["embedding"])
         except Exception as e:
-            print(f"Retrieval error: {e}")
-            # Fallback: return first few chunks
+            print(f"Query embedding failed: {e}")
             return chunks[:top_k]
-    
+
+        sims = cosine_similarity([query_emb], embedded_chunks).flatten()
+        top_indices = np.argsort(sims)[-top_k:][::-1]
+        return [texts[i] for i in top_indices]
+
     async def generate_answer(self, question: str, context: str) -> str:
-        """Generate answer using Gemini"""
-        prompt = f"""Based on the following policy context, provide a direct and concise answer to the question.
+        prompt = f"""You are a highly knowledgeable and concise insurance policy assistant.
 
-CONTEXT:
+Given the following policy excerpt and user question, answer with clear, factual, and context-specific information ONLY from the policy text.
+
+If the policy explicitly answers the question, include:
+- Direct yes/no at the start (if applicable)
+- Specific figures, time periods, and conditions as stated
+- Definitions or clauses from the text (in summarized form)
+
+If the policy does NOT provide a clear answer, respond with:
+"Information not available in the provided policy document."
+
+---
+
+Policy Excerpt:
+\"\"\"
 {context}
+\"\"\"
 
-QUESTION: {question}
+Question:
+{question}
 
-ANSWER:"""
-        
+Answer in one or two sentences, in formal, bulletproof language. Avoid hedging or speculation.
+
+Answer:"""
         try:
             response = await asyncio.to_thread(
                 self.model.generate_content,
@@ -118,68 +144,52 @@ ANSWER:"""
             print(f"Generation error: {e}")
             return f"Unable to process question: {question}"
 
-# Initialize RAG system
-rag_system = LightweightRAG()
-
 # --- PDF Processing ---
 def extract_text_from_pdf(pdf_path: str) -> str:
-    """Extract text from PDF using PyMuPDF"""
     try:
         doc = fitz.open(pdf_path)
-        text_parts = []
-        
-        for page in doc:
-            text = page.get_text()
-            if text.strip():
-                text_parts.append(text)
-        
+        text_parts = [page.get_text() for page in doc if page.get_text().strip()]
         doc.close()
         return "\n".join(text_parts)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"PDF processing error: {str(e)}")
 
+# Initialize RAG system
+rag_system = LightweightRAG()
+
 # --- Main Endpoint ---
 @app.post("/api/v1/hackrx/run", response_model=QueryResponse)
 async def run_analysis(request: QueryRequest, token: str = Depends(verify_token)):
     try:
-        # Download PDF with timeout
         headers = {"User-Agent": "Mozilla/5.0"}
         response = requests.get(request.documents, headers=headers, timeout=30)
         response.raise_for_status()
 
-        # Process PDF
         with tempfile.NamedTemporaryFile(delete=True, suffix=".pdf") as temp_file:
             temp_file.write(response.content)
             temp_file.flush()
-            
-            # Extract and clean text
+
             raw_text = extract_text_from_pdf(temp_file.name)
             clean_text = rag_system.clean_text(raw_text)
-            
-            # Create chunks
             chunks = rag_system.chunk_text(clean_text)
-            
             if not chunks:
                 raise HTTPException(status_code=400, detail="No text could be extracted from PDF")
 
-        # Process all questions concurrently
         async def process_question(question: str) -> str:
             relevant_chunks = rag_system.retrieve_relevant_chunks(question, chunks)
             context = "\n\n".join(relevant_chunks)
             return await rag_system.generate_answer(question, context)
-        
-        # Generate all answers concurrently
+
         tasks = [process_question(q) for q in request.questions]
         answers = await asyncio.gather(*tasks, return_exceptions=True)
-        
-        # Handle any exceptions in individual tasks
+
         final_answers = []
         for i, answer in enumerate(answers):
             if isinstance(answer, Exception):
                 final_answers.append(f"Error processing question {i+1}: {str(answer)}")
             else:
                 final_answers.append(answer)
-        
+
         return QueryResponse(answers=final_answers)
 
     except requests.RequestException as e:
@@ -188,12 +198,10 @@ async def run_analysis(request: QueryRequest, token: str = Depends(verify_token)
         print(f"Processing error: {e}")
         raise HTTPException(status_code=500, detail=f"Processing error: {str(e)}")
 
-# Health check endpoint
 @app.get("/health")
 async def health_check():
     return {"status": "healthy", "message": "Policy Analyzer API is running"}
 
-# Root endpoint
 @app.get("/")
 async def root():
     return {"message": "HackRx 6.0 Policy Analyzer - Optimized Version"}
