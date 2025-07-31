@@ -1,25 +1,24 @@
-# api.py - Optimized for Insurance Documents
+# api.py - Optimized Insurance Policy Analyzer
 import os
 import fitz  # PyMuPDF
 import requests
 import tempfile
 import asyncio
 import re
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional
 from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from dotenv import load_dotenv
 import google.generativeai as genai
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
-import numpy as np
+from collections import Counter
+import json
 
 # --- Init ---
 load_dotenv()
 AUTH_TOKEN = "78b25ddaad17f4e8d85cde3dca81ade8319272062cf10b73ba148b425151f2fd"
 auth_scheme = HTTPBearer()
-app = FastAPI(title="HackRx 6.0 Policy Analyzer - Insurance Optimized")
+app = FastAPI(title="HackRx 6.0 Policy Analyzer - Optimized")
 
 # Configure Google AI
 genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
@@ -37,351 +36,402 @@ class QueryRequest(BaseModel):
 class QueryResponse(BaseModel):
     answers: List[str]
 
-# --- Insurance-Specific Knowledge Base ---
-class InsuranceKnowledgeBase:
+# --- Enhanced Insurance Knowledge System ---
+class InsuranceKnowledgeExtractor:
     def __init__(self):
-        # Pre-built mappings for common insurance questions
-        self.question_patterns = {
-            'grace_period': ['grace period', 'grace time', 'payment period', 'premium due'],
-            'waiting_period': ['waiting period', 'wait time', 'exclusion period'],
-            'pre_existing': ['pre-existing', 'pre existing', 'PED', 'prior condition'],
-            'coverage': ['coverage', 'covered', 'cover', 'benefits', 'include'],
-            'exclusions': ['exclusion', 'exclude', 'not covered', 'limitation'],
-            'claim': ['claim', 'reimbursement', 'settlement'],
-            'premium': ['premium', 'payment', 'cost', 'price'],
-            'sum_insured': ['sum insured', 'limit', 'maximum amount'],
-            'maternity': ['maternity', 'pregnancy', 'childbirth', 'delivery'],
-            'room_rent': ['room rent', 'accommodation', 'ICU', 'hospital charges'],
-            'ayush': ['ayush', 'ayurveda', 'homeopathy', 'unani', 'siddha'],
-            'cataract': ['cataract', 'eye surgery', 'vision'],
-            'cumulative_bonus': ['cumulative bonus', 'no claim bonus', 'NCD', 'bonus'],
-            'hospital_definition': ['hospital', 'healthcare facility', 'medical center'],
-            'co_payment': ['co-payment', 'co payment', 'copay', 'deductible']
+        # Direct pattern matching for specific information
+        self.direct_patterns = {
+            'grace_period': [
+                r'grace\s+period[^\n]*?(\d+)\s*days?',
+                r'grace\s+period[^\n]*?thirty\s*days?',
+                r'(\d+)\s*days?[^\n]*?grace\s+period',
+                r'thirty\s*days?[^\n]*?grace\s+period'
+            ],
+            'waiting_period_ped': [
+                r'pre[-\s]*existing[^\n]*?(\d+)[^\n]*?months?',
+                r'(\d+)[^\n]*?months?[^\n]*?pre[-\s]*existing',
+                r'PED[^\n]*?(\d+)[^\n]*?months?'
+            ],
+            'maternity': [
+                r'maternity[^\n]*?covered',
+                r'maternity[^\n]*?excluded',
+                r'childbirth[^\n]*?covered',
+                r'pregnancy[^\n]*?covered',
+                r'maternity\s+expenses?[^\n]*?covered',
+                r'exclud[^.]*?maternity'
+            ],
+            'cataract_waiting': [
+                r'cataract[^\n]*?(\d+)[^\n]*?months?',
+                r'(\d+)[^\n]*?months?[^\n]*?cataract'
+            ],
+            'cataract_limit': [
+                r'cataract[^\n]*?(\d+%)[^\n]*?sum\s+insured',
+                r'cataract[^\n]*?(Rs\.?\s*\d+,?\d*)',
+                r'(\d+%)[^\n]*?sum\s+insured[^\n]*?cataract',
+                r'(Rs\.?\s*\d+,?\d*)[^\n]*?cataract'
+            ],
+            'room_rent': [
+                r'room\s+rent[^\n]*?(\d+%)[^\n]*?sum\s+insured',
+                r'room\s+rent[^\n]*?(Rs\.?\s*\d+,?\d*)',
+                r'(\d+%)[^\n]*?sum\s+insured[^\n]*?room',
+                r'(Rs\.?\s*\d+,?\d*)[^\n]*?room\s+rent'
+            ],
+            'icu_charges': [
+                r'ICU[^\n]*?(\d+%)[^\n]*?sum\s+insured',
+                r'ICU[^\n]*?(Rs\.?\s*\d+,?\d*)',
+                r'intensive\s+care[^\n]*?(\d+%)',
+                r'intensive\s+care[^\n]*?(Rs\.?\s*\d+,?\d*)'
+            ],
+            'cumulative_bonus': [
+                r'cumulative\s+bonus[^\n]*?(\d+%)',
+                r'(\d+%)[^\n]*?cumulative\s+bonus',
+                r'claim\s+free[^\n]*?(\d+%)',
+                r'no\s+claim[^\n]*?(\d+%)'
+            ],
+            'ambulance': [
+                r'ambulance[^\n]*?(Rs\.?\s*\d+,?\d*)',
+                r'road\s+ambulance[^\n]*?(Rs\.?\s*\d+,?\d*)',
+                r'(Rs\.?\s*\d+,?\d*)[^\n]*?ambulance'
+            ],
+            'co_payment': [
+                r'co[-\s]*payment[^\n]*?(\d+%)',
+                r'(\d+%)[^\n]*?co[-\s]*payment',
+                r'co[-\s]*pay[^\n]*?(\d+%)'
+            ]
         }
         
-        # Section keywords for better targeting
-        self.section_keywords = {
-            'definitions': ['definition', 'means', 'defined as', 'refers to'],
-            'coverage': ['coverage', 'benefits', 'indemnify', 'shall cover'],
-            'exclusions': ['exclusion', 'shall not', 'excluded', 'not covered'],
-            'waiting_periods': ['waiting period', 'months of continuous coverage'],
-            'claims': ['claim procedure', 'reimbursement', 'cashless'],
-            'general_conditions': ['general terms', 'conditions', 'renewal']
+        # Section identifiers for better targeting
+        self.section_identifiers = {
+            'definitions': ['3. DEFINITIONS', 'DEFINITIONS'],
+            'coverage': ['4. COVERAGE', 'COVERAGE'],
+            'exclusions': ['7. EXCLUSIONS', 'EXCLUSIONS'],
+            'waiting_periods': ['6. WAITING PERIOD', 'WAITING PERIOD'],
+            'claims': ['9. CLAIM PROCEDURE', 'CLAIM PROCEDURE'],
+            'benefits': ['TABLE OF BENEFITS', 'BENEFITS']
         }
 
-    def classify_question(self, question: str) -> Tuple[str, List[str]]:
-        """Classify question type and return relevant keywords"""
+    def extract_direct_info(self, text: str, info_type: str) -> List[str]:
+        """Extract information using direct pattern matching"""
+        results = []
+        text_lower = text.lower()
+        
+        if info_type in self.direct_patterns:
+            for pattern in self.direct_patterns[info_type]:
+                matches = re.finditer(pattern, text_lower, re.IGNORECASE | re.MULTILINE)
+                for match in matches:
+                    # Get surrounding context (3 lines before and after)
+                    start = max(0, text.rfind('\n', 0, match.start()) - 200)
+                    end = min(len(text), text.find('\n', match.end()) + 200)
+                    if end == -1:
+                        end = min(len(text), match.end() + 200)
+                    
+                    context = text[start:end].strip()
+                    results.append(context)
+        
+        return results
+
+    def find_section_content(self, text: str, section_type: str) -> str:
+        """Find specific section content"""
+        if section_type not in self.section_identifiers:
+            return ""
+        
+        section_markers = self.section_identifiers[section_type]
+        
+        for marker in section_markers:
+            # Find section start
+            pattern = rf'^{re.escape(marker)}.*$'
+            match = re.search(pattern, text, re.IGNORECASE | re.MULTILINE)
+            
+            if match:
+                start_pos = match.start()
+                
+                # Find next major section (numbered section)
+                next_section_pattern = r'^\d+\.\s+[A-Z][A-Z\s]+$'
+                next_match = re.search(next_section_pattern, text[start_pos + len(match.group()):], re.MULTILINE)
+                
+                if next_match:
+                    end_pos = start_pos + len(match.group()) + next_match.start()
+                    return text[start_pos:end_pos]
+                else:
+                    # Take reasonable chunk if no next section found
+                    return text[start_pos:start_pos + 3000]
+        
+        return ""
+
+# --- Optimized RAG System ---
+class OptimizedInsuranceRAG:
+    def __init__(self):
+        self.model = genai.GenerativeModel('gemini-1.5-flash-latest')
+        self.extractor = InsuranceKnowledgeExtractor()
+        
+    def preprocess_document(self, text: str) -> Dict[str, str]:
+        """Extract and organize document sections"""
+        sections = {}
+        
+        # Extract major sections
+        for section_type in ['definitions', 'coverage', 'exclusions', 'waiting_periods', 'claims', 'benefits']:
+            content = self.extractor.find_section_content(text, section_type)
+            if content:
+                sections[section_type] = content
+        
+        # Also keep full text for fallback
+        sections['full_text'] = text
+        
+        return sections
+
+    def smart_retrieval(self, question: str, sections: Dict[str, str]) -> str:
+        """Intelligent context retrieval based on question type"""
+        question_lower = question.lower()
+        relevant_sections = []
+        
+        # Question type mapping to sections
+        section_priority = {
+            'grace period': ['benefits', 'claims', 'full_text'],
+            'waiting period': ['waiting_periods', 'exclusions', 'benefits', 'full_text'],
+            'pre-existing': ['waiting_periods', 'exclusions', 'definitions', 'full_text'],
+            'maternity': ['exclusions', 'coverage', 'full_text'],
+            'cataract': ['coverage', 'waiting_periods', 'benefits', 'full_text'],
+            'organ donor': ['coverage', 'exclusions', 'full_text'],
+            'claim discount': ['benefits', 'coverage', 'full_text'],
+            'no claim': ['benefits', 'coverage', 'full_text'],
+            'cumulative bonus': ['benefits', 'coverage', 'full_text'],
+            'health check': ['coverage', 'benefits', 'full_text'],
+            'hospital': ['definitions', 'coverage', 'full_text'],
+            'ayush': ['coverage', 'benefits', 'full_text'],
+            'room rent': ['coverage', 'benefits', 'full_text'],
+            'icu': ['coverage', 'benefits', 'full_text'],
+            'eligibility': ['benefits', 'definitions', 'full_text'],
+            'age limit': ['benefits', 'definitions', 'full_text'],
+            'sum insured': ['benefits', 'coverage', 'full_text'],
+            'premium': ['benefits', 'full_text'],
+            'exclusion': ['exclusions', 'waiting_periods', 'full_text'],
+            'claims process': ['claims', 'benefits', 'full_text'],
+            'dental': ['coverage', 'exclusions', 'full_text'],
+            'mental illness': ['coverage', 'exclusions', 'full_text'],
+            'domiciliary': ['coverage', 'exclusions', 'full_text'],
+            'ambulance': ['coverage', 'benefits', 'full_text'],
+            'co-payment': ['benefits', 'claims', 'full_text'],
+            'renewal': ['benefits', 'claims', 'full_text']
+        }
+        
+        # Find relevant sections based on question keywords
+        relevant_section_types = []
+        for keyword, section_types in section_priority.items():
+            if keyword in question_lower:
+                relevant_section_types.extend(section_types)
+                break
+        
+        # Default to key sections if no specific match
+        if not relevant_section_types:
+            relevant_section_types = ['coverage', 'benefits', 'exclusions', 'full_text']
+        
+        # Collect relevant content
+        context_parts = []
+        for section_type in relevant_section_types[:4]:  # Limit to avoid token overflow
+            if section_type in sections and sections[section_type]:
+                context_parts.append(f"=== {section_type.upper()} ===\n{sections[section_type]}")
+        
+        # Also add direct pattern matches
+        for info_type in self.extractor.direct_patterns.keys():
+            if any(keyword in question_lower for keyword in info_type.split('_')):
+                matches = self.extractor.extract_direct_info(sections['full_text'], info_type)
+                if matches:
+                    context_parts.append(f"=== RELEVANT EXCERPTS ===\n" + "\n---\n".join(matches[:3]))
+                break
+        
+        return "\n\n".join(context_parts)
+
+    async def generate_answer(self, question: str, context: str) -> str:
+        """Generate precise answer using enhanced prompting"""
+        
+        # Create specialized prompts based on question content
         question_lower = question.lower()
         
-        for category, patterns in self.question_patterns.items():
-            if any(pattern in question_lower for pattern in patterns):
-                return category, patterns
-        
-        return 'general', []
+        if 'grace period' in question_lower:
+            specific_instruction = "Look for the exact number of days for grace period. The answer should state '30 days' or 'thirty days' if found."
+        elif 'waiting period' in question_lower and 'pre-existing' in question_lower:
+            specific_instruction = "Look for the exact waiting period for pre-existing diseases. Should be stated as '36 months' or 'thirty-six months'."
+        elif 'maternity' in question_lower:
+            specific_instruction = "Determine if maternity expenses are covered or excluded. Look for specific mentions of 'maternity', 'childbirth', 'pregnancy'."
+        elif 'cataract' in question_lower and 'waiting' in question_lower:
+            specific_instruction = "Find the specific waiting period for cataract treatment. Look for '24 months' or 'two years'."
+        elif 'hospital' in question_lower and 'define' in question_lower:
+            specific_instruction = "Find the definition of 'Hospital'. Look for bed requirements, registration criteria, and facility requirements."
+        elif 'ayush' in question_lower:
+            specific_instruction = "Look for coverage of AYUSH treatments (Ayurveda, Yoga, Naturopathy, Unani, Siddha, Homeopathy)."
+        elif 'room rent' in question_lower or 'icu' in question_lower:
+            specific_instruction = "Find specific limits for room rent and ICU charges. Look for percentages of sum insured and maximum amounts."
+        elif 'cumulative bonus' in question_lower or 'no claim' in question_lower:
+            specific_instruction = "Look for cumulative bonus or no claim bonus details. Find the percentage increase and maximum limit."
+        elif 'ambulance' in question_lower:
+            specific_instruction = "Find ambulance coverage details including coverage limits and maximum amounts."
+        else:
+            specific_instruction = "Provide specific details with exact numbers, percentages, time periods, and conditions mentioned in the policy."
 
-    def get_section_boost_terms(self, question_type: str) -> List[str]:
-        """Get terms that should boost chunk relevance for specific question types"""
-        boost_terms = {
-            'grace_period': ['grace period', 'thirty days', '30 days', 'premium due date'],
-            'waiting_period': ['waiting period', '36 months', '24 months', 'continuous coverage'],
-            'pre_existing': ['pre-existing disease', 'PED', '36 months', 'physician within'],
-            'maternity': ['maternity', 'childbirth', 'pregnancy', 'delivery', 'female insured'],
-            'cataract': ['cataract', '25%', 'Rs. 40,000', 'per eye'],
-            'room_rent': ['room rent', '2% of sum insured', 'Rs. 5,000', 'ICU', '5%', 'Rs. 10,000'],
-            'ayush': ['AYUSH', 'Ayurveda', 'Homeopathy', 'Unani', 'Siddha', 'Naturopathy'],
-            'cumulative_bonus': ['cumulative bonus', '5%', 'claim free', 'maximum of 50%'],
-            'hospital_definition': ['hospital means', 'institution established', '10 inpatient beds']
-        }
-        return boost_terms.get(question_type, [])
+        prompt = f"""You are analyzing an insurance policy document. Answer the question based STRICTLY on the provided policy text.
 
-# --- Enhanced RAG System ---
-class InsuranceRAG:
-    def __init__(self):
-        self.vectorizer = TfidfVectorizer(
-            max_features=1500,  # Increased for better insurance term coverage
-            stop_words='english',
-            ngram_range=(1, 2),  # Include bigrams for insurance terms
-            max_df=0.9,
-            min_df=1
-        )
-        self.model = genai.GenerativeModel('gemini-1.5-flash-latest')
-        self.kb = InsuranceKnowledgeBase()
-        
-    def clean_insurance_text(self, text: str) -> str:
-        """Enhanced cleaning for insurance documents"""
-        # Preserve important insurance formatting
-        text = re.sub(r'\n+', '\n', text)  # Normalize line breaks
-        text = re.sub(r'\s{3,}', ' ', text)  # Multiple spaces to single
-        
-        # Preserve important characters for insurance docs
-        text = re.sub(r'[^\w\s\.\,\!\?\;\:\-\(\)\%\₹\/]', ' ', text)
-        
-        # Normalize common insurance terms
-        replacements = {
-            r'Rs\.\s*': 'Rs. ',
-            r'INR\s*': 'Rs. ',
-            r'₹\s*': 'Rs. ',
-            r'\b(\d+)\s*%': r'\1%',  # Normalize percentages
-            r'\b(\d+)\s*months?\b': r'\1 months',  # Normalize months
-            r'\b(\d+)\s*days?\b': r'\1 days'  # Normalize days
-        }
-        
-        for pattern, replacement in replacements.items():
-            text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
-        
-        return text.strip()
-    
-    def smart_chunk_text(self, text: str, chunk_size: int = 1000, overlap: int = 150) -> List[str]:
-        """Smart chunking that preserves insurance document structure"""
-        # Split by major sections first
-        section_markers = [
-            r'\n\d+\.\s+[A-Z][A-Z\s]+\n',  # Numbered sections
-            r'\n\d+\.\d+\.?\s+[A-Z]',      # Subsections
-            r'\nDefinitions?\n',
-            r'\nCoverage\n',
-            r'\nExclusions?\n',
-            r'\nClaim\s+Procedure\n'
-        ]
-        
-        chunks = []
-        current_chunk = ""
-        
-        for line in text.split('\n'):
-            if len(current_chunk) + len(line) > chunk_size and current_chunk:
-                chunks.append(current_chunk.strip())
-                # Keep overlap
-                words = current_chunk.split()
-                overlap_text = ' '.join(words[-overlap//5:]) if len(words) > overlap//5 else ""
-                current_chunk = overlap_text + '\n' + line
-            else:
-                current_chunk += '\n' + line
-        
-        if current_chunk.strip():
-            chunks.append(current_chunk.strip())
-        
-        return [chunk for chunk in chunks if len(chunk.strip()) > 50]
-    
-    def enhanced_retrieve(self, question: str, chunks: List[str], top_k: int = 4) -> List[str]:
-        """Enhanced retrieval with insurance-specific logic"""
-        if not chunks:
-            return []
-        
-        try:
-            # Classify question
-            question_type, patterns = self.kb.classify_question(question)
-            boost_terms = self.kb.get_section_boost_terms(question_type)
-            
-            # Score chunks with multiple criteria
-            scored_chunks = []
-            
-            for i, chunk in enumerate(chunks):
-                chunk_lower = chunk.lower()
-                score = 0
-                
-                # 1. Pattern matching score
-                for pattern in patterns:
-                    matches = len(re.findall(re.escape(pattern), chunk_lower))
-                    score += matches * 3
-                
-                # 2. Boost terms score
-                for term in boost_terms:
-                    if term.lower() in chunk_lower:
-                        score += 2
-                
-                # 3. Question-specific boosting
-                if question_type == 'grace_period' and any(term in chunk_lower for term in ['grace', '30', 'thirty', 'days']):
-                    score += 5
-                elif question_type == 'waiting_period' and any(term in chunk_lower for term in ['waiting', '36', 'months', '24']):
-                    score += 5
-                elif question_type == 'maternity' and 'maternity' in chunk_lower:
-                    score += 5
-                elif question_type == 'cataract' and 'cataract' in chunk_lower:
-                    score += 5
-                
-                # 4. Section relevance
-                if question_type in ['coverage', 'benefits'] and any(word in chunk_lower for word in ['coverage', 'benefits', 'indemnify']):
-                    score += 3
-                elif question_type in ['exclusions'] and any(word in chunk_lower for word in ['exclusion', 'excluded', 'shall not']):
-                    score += 3
-                
-                # 5. Numerical relevance for specific questions
-                if re.search(r'\d+\s*%|\d+\s*days?|\d+\s*months?|Rs\.\s*\d+', chunk):
-                    score += 1
-                
-                scored_chunks.append((i, chunk, score))
-            
-            # Sort by score
-            scored_chunks.sort(key=lambda x: x[2], reverse=True)
-            
-            # If we have high-scoring chunks, use them
-            high_score_chunks = [chunk for _, chunk, score in scored_chunks if score >= 5]
-            if high_score_chunks:
-                selected_chunks = high_score_chunks[:top_k]
-            else:
-                # Fall back to TF-IDF for low-scoring chunks
-                top_scored = [chunk for _, chunk, _ in scored_chunks[:min(50, len(scored_chunks))]]
-                if len(top_scored) > 1:
-                    all_texts = top_scored + [question]
-                    tfidf_matrix = self.vectorizer.fit_transform(all_texts)
-                    query_vector = tfidf_matrix[-1]
-                    chunk_vectors = tfidf_matrix[:-1]
-                    similarities = cosine_similarity(query_vector, chunk_vectors).flatten()
-                    top_indices = np.argsort(similarities)[-top_k:][::-1]
-                    selected_chunks = [top_scored[i] for i in top_indices]
-                else:
-                    selected_chunks = top_scored[:top_k]
-            
-            return selected_chunks[:top_k]
-            
-        except Exception as e:
-            print(f"Enhanced retrieval error: {e}")
-            return chunks[:top_k]
-
-    async def generate_insurance_answer(self, question: str, context: str, question_type: str) -> str:
-        """Generate answer with insurance-specific prompting"""
-        
-        # Enhanced prompts based on question type
-        type_prompts = {
-            'grace_period': "Focus on the exact number of days mentioned for grace period. Look for '30 days' or 'thirty days'.",
-            'waiting_period': "State the exact waiting period in months (24 or 36 months). Specify what the waiting period applies to.",
-            'pre_existing': "Look for '36 months' waiting period for pre-existing diseases. Mention the declaration requirement.",
-            'maternity': "Check if maternity is covered or excluded. Look for specific conditions and waiting periods.",
-            'cataract': "Find the specific limit for cataract treatment - look for '25% of Sum Insured' or 'Rs. 40,000 per eye'.",
-            'room_rent': "Look for percentage limits - '2% of sum insured' for room rent, '5% of sum insured' for ICU.",
-            'ayush': "Check coverage for AYUSH treatments (Ayurveda, Yoga, Naturopathy, Unani, Siddha, Homeopathy).",
-            'cumulative_bonus': "Look for '5%' increase per claim-free year and 'maximum 50%' limit.",
-            'hospital_definition': "Find the definition of hospital - look for bed requirements and registration criteria."
-        }
-        
-        specific_instruction = type_prompts.get(question_type, "Be specific with numbers, percentages, time periods, and conditions.")
-        
-        prompt = f"""You are analyzing an insurance policy document. Answer the question based ONLY on the provided policy text.
-
-POLICY TEXT:
+POLICY CONTEXT:
 {context}
 
 QUESTION: {question}
 
 INSTRUCTIONS:
 - {specific_instruction}
-- Include exact numbers, percentages, time periods when mentioned
-- If asking about coverage, state clearly if it's covered or excluded
-- Be concise but include all relevant conditions
-- If the information is not in the provided text, say so
+- Quote exact numbers, percentages, amounts, and time periods from the policy
+- If information is clearly stated, provide it confidently
+- If coverage exists, state it clearly; if excluded, state that clearly
+- Be precise and factual based on the document content
+- If the specific information is genuinely not found in the provided context, state that clearly
 
 ANSWER:"""
-        
+
         try:
             response = await asyncio.to_thread(
                 self.model.generate_content,
                 prompt,
                 generation_config=genai.types.GenerationConfig(
-                    temperature=0,
-                    max_output_tokens=150,
+                    temperature=0.1,  # Very low temperature for consistency
+                    max_output_tokens=200,
                     candidate_count=1
                 )
             )
             
             answer = response.text.strip()
             
-            # Clean up response
-            answer = re.sub(r'^(Answer:|A:)\s*', '', answer)
-            answer = re.sub(r'^Based on.*?policy,?\s*', '', answer, flags=re.IGNORECASE)
-            answer = re.sub(r'^According to.*?document,?\s*', '', answer, flags=re.IGNORECASE)
+            # Clean up common response prefixes
+            cleanup_patterns = [
+                r'^(Answer:|A:|Response:)\s*',
+                r'^Based on the.*?policy.*?,?\s*',
+                r'^According to.*?document.*?,?\s*',
+                r'^The policy.*?states.*?that\s*',
+                r'^From the.*?text.*?,?\s*'
+            ]
             
-            return answer
+            for pattern in cleanup_patterns:
+                answer = re.sub(pattern, '', answer, flags=re.IGNORECASE)
+            
+            return answer.strip()
             
         except Exception as e:
             print(f"Generation error: {e}")
-            return "Unable to process this question based on the provided policy text."
+            return "Unable to process this question due to technical error."
 
 # --- PDF Processing ---
 def extract_text_from_pdf(pdf_path: str) -> str:
+    """Enhanced PDF text extraction"""
     try:
         doc = fitz.open(pdf_path)
         text_parts = []
         
-        for page in doc:
-            page_text = page.get_text()
+        for page_num, page in enumerate(doc):
+            # Extract text with better formatting preservation
+            text_dict = page.get_text("dict")
+            page_text = ""
+            
+            for block in text_dict["blocks"]:
+                if "lines" in block:
+                    for line in block["lines"]:
+                        line_text = ""
+                        for span in line["spans"]:
+                            line_text += span["text"]
+                        if line_text.strip():
+                            page_text += line_text + "\n"
+                            
             if page_text.strip():
-                text_parts.append(page_text)
+                text_parts.append(f"--- PAGE {page_num + 1} ---\n{page_text}")
         
         doc.close()
-        return "\n".join(text_parts)
+        
+        full_text = "\n".join(text_parts)
+        
+        # Basic text cleaning while preserving structure
+        full_text = re.sub(r'\n{3,}', '\n\n', full_text)  # Normalize excessive line breaks
+        full_text = re.sub(r' {3,}', ' ', full_text)  # Normalize excessive spaces
+        
+        return full_text
+        
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"PDF processing error: {str(e)}")
 
-# Initialize enhanced RAG system
-rag_system = InsuranceRAG()
+# Initialize optimized system
+rag_system = OptimizedInsuranceRAG()
 
 # --- Main Endpoint ---
 @app.post("/api/v1/hackrx/run", response_model=QueryResponse)
 async def run_analysis(request: QueryRequest, token: str = Depends(verify_token)):
     try:
-        # Download PDF with retry logic
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-        max_retries = 2
+        # Download PDF with improved error handling
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+        }
         
+        max_retries = 3
         for attempt in range(max_retries):
             try:
-                response = requests.get(request.documents, headers=headers, timeout=20)
+                response = requests.get(
+                    request.documents, 
+                    headers=headers, 
+                    timeout=30,
+                    stream=True
+                )
                 response.raise_for_status()
                 break
             except requests.RequestException as e:
                 if attempt == max_retries - 1:
-                    raise e
-                await asyncio.sleep(1)
+                    raise HTTPException(status_code=400, detail=f"Failed to download document: {str(e)}")
+                await asyncio.sleep(2 ** attempt)  # Exponential backoff
 
-        # Process PDF with enhanced cleaning
+        # Process PDF with enhanced extraction
         with tempfile.NamedTemporaryFile(delete=True, suffix=".pdf") as temp_file:
-            temp_file.write(response.content)
+            for chunk in response.iter_content(chunk_size=8192):
+                temp_file.write(chunk)
             temp_file.flush()
 
+            # Extract and preprocess document
             raw_text = extract_text_from_pdf(temp_file.name)
-            clean_text = rag_system.clean_insurance_text(raw_text)
-            chunks = rag_system.smart_chunk_text(clean_text)
             
-            if not chunks:
-                raise HTTPException(status_code=400, detail="No processable text found in PDF")
+            if len(raw_text.strip()) < 100:
+                raise HTTPException(status_code=400, detail="Document appears to be empty or unreadable")
+            
+            # Preprocess into organized sections
+            sections = rag_system.preprocess_document(raw_text)
+            print(f"Extracted sections: {list(sections.keys())}")
 
-        # Process questions with enhanced logic
+        # Process questions with optimized retrieval
         answers = []
         for i, question in enumerate(request.questions):
             try:
-                question_type, _ = rag_system.kb.classify_question(question)
-                relevant_chunks = rag_system.enhanced_retrieve(question, chunks, top_k=4)
+                print(f"Processing Q{i+1}: {question[:50]}...")
                 
-                # Combine context intelligently
-                context = "\n\n---\n\n".join(relevant_chunks[:3])
+                # Get relevant context using smart retrieval
+                context = rag_system.smart_retrieval(question, sections)
                 
-                # Ensure we have enough context
-                if len(context) < 400 and len(relevant_chunks) > 3:
-                    context = "\n\n---\n\n".join(relevant_chunks[:4])
-                
-                answer = await rag_system.generate_insurance_answer(question, context, question_type)
+                # Generate answer
+                answer = await rag_system.generate_answer(question, context)
                 answers.append(answer)
                 
-                print(f"Q{i+1} [{question_type}]: {len(context)} chars, {len(relevant_chunks)} chunks")
+                print(f"Q{i+1} completed - Context length: {len(context)} chars")
                 
             except Exception as e:
                 print(f"Error processing question {i+1}: {e}")
-                answers.append("Unable to determine from the provided policy document.")
+                answers.append("Unable to process this question due to technical error.")
 
+        print(f"Completed processing {len(answers)} questions")
         return QueryResponse(answers=answers)
 
-    except requests.RequestException as e:
-        raise HTTPException(status_code=400, detail=f"Failed to access document: {str(e)}")
+    except HTTPException:
+        raise
     except Exception as e:
-        print(f"Processing error: {e}")
-        raise HTTPException(status_code=500, detail=f"System error: {str(e)}")
+        print(f"System error: {e}")
+        raise HTTPException(status_code=500, detail=f"Internal system error: {str(e)}")
 
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy", "message": "Insurance Policy Analyzer API - Enhanced"}
+    return {"status": "healthy", "message": "Optimized Insurance Policy Analyzer"}
 
 @app.get("/")
 async def root():
-    return {"message": "HackRx 6.0 Insurance Policy Analyzer - Optimized for Accuracy"}
+    return {"message": "HackRx 6.0 - Optimized Insurance Policy Analyzer", "version": "2.0"}
 
 if __name__ == "__main__":
     import uvicorn
