@@ -1,4 +1,3 @@
-
 # api.py
 import os
 import fitz  # PyMuPDF
@@ -6,14 +5,13 @@ import requests
 import tempfile
 import asyncio
 import re
-import hashlib
-import json
 from typing import List, Dict, Any
 from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from dotenv import load_dotenv
 import google.generativeai as genai
+from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 import numpy as np
 
@@ -39,110 +37,94 @@ class QueryRequest(BaseModel):
 class QueryResponse(BaseModel):
     answers: List[str]
 
-# --- Lightweight Text Processing ---
+# --- Lightweight RAG System ---
 class LightweightRAG:
     def __init__(self):
-        self.model = genai.GenerativeModel("gemini-1.5-flash-latest")
-    
+        self.vectorizer = TfidfVectorizer(
+            max_features=1000,  # Reduced for large docs
+            stop_words='english',
+            ngram_range=(1, 1),  # Only unigrams for speed
+            max_df=0.95,
+            min_df=1  # Allow rare terms in large docs
+        )
+        self.model = genai.GenerativeModel('gemini-1.5-flash-latest')
+        
     def clean_text(self, text: str) -> str:
-        text = re.sub(r"\s+", " ", text)
-        text = re.sub(r"[^\w\s\.\,\!\?\;\:\-\(\)]", "", text)
+        text = re.sub(r'\s+', ' ', text)
+        text = re.sub(r'[^\w\s\.\,\!\?\;\:\-\(\)]', '', text)
         return text.strip()
     
-    def chunk_text(self, text: str, chunk_size: int = 1000, overlap: int = 150) -> List[str]:
+    def chunk_text(self, text: str, chunk_size: int = 800, overlap: int = 100) -> List[str]:
         words = text.split()
         chunks = []
         for i in range(0, len(words), chunk_size - overlap):
-            chunk = " ".join(words[i:i + chunk_size])
+            chunk = ' '.join(words[i:i + chunk_size])
             if chunk.strip():
                 chunks.append(chunk)
         return chunks
-
-    def _hash_text(self, text: str) -> str:
-        return hashlib.sha256(text.encode("utf-8")).hexdigest()
     
-    def save_embedding_cache(self, key: str, data: List[Dict[str, Any]], dir="embedding_cache"):
-        os.makedirs(dir, exist_ok=True)
-        path = os.path.join(dir, f"{key}.json")
-        with open(path, "w") as f:
-            json.dump(data, f)
-
-    def load_embedding_cache(self, key: str, dir="embedding_cache") -> List[Dict[str, Any]]:
-        path = os.path.join(dir, f"{key}.json")
-        if os.path.exists(path):
-            with open(path, "r") as f:
-                return json.load(f)
-        return []
-
     def retrieve_relevant_chunks(self, query: str, chunks: List[str], top_k: int = 3) -> List[str]:
-        cache_key = self._hash_text("".join(chunks))
-        cached = self.load_embedding_cache(cache_key)
-
-        if cached:
-            embedded_chunks = [np.array(item["embedding"]) for item in cached]
-            texts = [item["text"] for item in cached]
-        else:
-            embedded_chunks = []
-            texts = []
-            for chunk in chunks:
-                try:
-                    emb = self.model.embed_content(content=chunk, task_type="retrieval_document")["embedding"]
-                    embedded_chunks.append(np.array(emb))
-                    texts.append(chunk)
-                except Exception as e:
-                    print(f"Embedding failed: {e}")
-            self.save_embedding_cache(cache_key, [{"text": t, "embedding": e.tolist()} for t, e in zip(texts, embedded_chunks)])
-
+        if not chunks:
+            return []
         try:
-            query_emb = np.array(self.model.embed_content(content=query, task_type="retrieval_query")["embedding"])
+            # For large documents, pre-filter chunks by keyword matching
+            if len(chunks) > 200:
+                query_words = set(query.lower().split())
+                scored_chunks = []
+                for i, chunk in enumerate(chunks):
+                    chunk_words = set(chunk.lower().split())
+                    keyword_score = len(query_words.intersection(chunk_words))
+                    if keyword_score > 0:
+                        scored_chunks.append((i, chunk, keyword_score))
+                
+                # Sort by keyword score and take top 50 for TF-IDF
+                scored_chunks.sort(key=lambda x: x[2], reverse=True)
+                filtered_chunks = [chunk for _, chunk, _ in scored_chunks[:50]]
+                chunk_indices = [i for i, _, _ in scored_chunks[:50]]
+            else:
+                filtered_chunks = chunks
+                chunk_indices = list(range(len(chunks)))
+            
+            if not filtered_chunks:
+                return chunks[:top_k]
+            
+            # Apply TF-IDF on filtered chunks
+            all_texts = filtered_chunks + [query]
+            tfidf_matrix = self.vectorizer.fit_transform(all_texts)
+            query_vector = tfidf_matrix[-1]
+            chunk_vectors = tfidf_matrix[:-1]
+            similarities = cosine_similarity(query_vector, chunk_vectors).flatten()
+            top_indices = np.argsort(similarities)[-top_k:][::-1]
+            relevant_chunks = [filtered_chunks[i] for i in top_indices if similarities[i] > 0.05]
+            return relevant_chunks if relevant_chunks else filtered_chunks[:2]
         except Exception as e:
-            print(f"Query embedding failed: {e}")
+            print(f"Retrieval error: {e}")
             return chunks[:top_k]
 
-        sims = cosine_similarity([query_emb], embedded_chunks).flatten()
-        top_indices = np.argsort(sims)[-top_k:][::-1]
-        return [texts[i] for i in top_indices]
-
     async def generate_answer(self, question: str, context: str) -> str:
-        prompt = f"""You are a highly knowledgeable and concise insurance policy assistant.
+        """Generate single answer for one question"""
+        prompt = f"""Answer based on policy text. Be direct and specific.
 
-Given the following policy excerpt and user question, answer with clear, factual, and context-specific information ONLY from the policy text.
+POLICY: {context}
 
-If the policy explicitly answers the question, include:
-- Direct yes/no at the start (if applicable)
-- Specific figures, time periods, and conditions as stated
-- Definitions or clauses from the text (in summarized form)
+QUESTION: {question}
 
-If the policy does NOT provide a clear answer, respond with:
-"Information not available in the provided policy document."
-
----
-
-Policy Excerpt:
-\"\"\"
-{context}
-\"\"\"
-
-Question:
-{question}
-
-Answer in one or two sentences, in formal, bulletproof language. Avoid hedging or speculation.
-
-Answer:"""
+ANSWER:"""
+        
         try:
             response = await asyncio.to_thread(
                 self.model.generate_content,
                 prompt,
                 generation_config=genai.types.GenerationConfig(
                     temperature=0,
-                    max_output_tokens=200,
+                    max_output_tokens=120,
                     candidate_count=1
                 )
             )
             return response.text.strip()
         except Exception as e:
             print(f"Generation error: {e}")
-            return f"Unable to process question: {question}"
+            return "Unable to process this question."
 
 # --- PDF Processing ---
 def extract_text_from_pdf(pdf_path: str) -> str:
@@ -161,10 +143,12 @@ rag_system = LightweightRAG()
 @app.post("/api/v1/hackrx/run", response_model=QueryResponse)
 async def run_analysis(request: QueryRequest, token: str = Depends(verify_token)):
     try:
+        # Download PDF
         headers = {"User-Agent": "Mozilla/5.0"}
-        response = requests.get(request.documents, headers=headers, timeout=30)
+        response = requests.get(request.documents, headers=headers, timeout=25)
         response.raise_for_status()
 
+        # Process PDF
         with tempfile.NamedTemporaryFile(delete=True, suffix=".pdf") as temp_file:
             temp_file.write(response.content)
             temp_file.flush()
@@ -172,25 +156,24 @@ async def run_analysis(request: QueryRequest, token: str = Depends(verify_token)
             raw_text = extract_text_from_pdf(temp_file.name)
             clean_text = rag_system.clean_text(raw_text)
             chunks = rag_system.chunk_text(clean_text)
+            
             if not chunks:
                 raise HTTPException(status_code=400, detail="No text could be extracted from PDF")
 
-        async def process_question(question: str) -> str:
-            relevant_chunks = rag_system.retrieve_relevant_chunks(question, chunks)
-            context = "\n\n".join(relevant_chunks)
-            return await rag_system.generate_answer(question, context)
+        # Process questions sequentially for reliability
+        answers = []
+        for i, question in enumerate(request.questions):
+            try:
+                relevant_chunks = rag_system.retrieve_relevant_chunks(question, chunks)
+                context = "\n\n".join(relevant_chunks[:2])  # Use top 2 chunks only
+                answer = await rag_system.generate_answer(question, context)
+                answers.append(answer)
+                print(f"Processed question {i+1}/{len(request.questions)}")
+            except Exception as e:
+                print(f"Error processing question {i+1}: {e}")
+                answers.append("Unable to process this question.")
 
-        tasks = [process_question(q) for q in request.questions]
-        answers = await asyncio.gather(*tasks, return_exceptions=True)
-
-        final_answers = []
-        for i, answer in enumerate(answers):
-            if isinstance(answer, Exception):
-                final_answers.append(f"Error processing question {i+1}: {str(answer)}")
-            else:
-                final_answers.append(answer)
-
-        return QueryResponse(answers=final_answers)
+        return QueryResponse(answers=answers)
 
     except requests.RequestException as e:
         raise HTTPException(status_code=400, detail=f"Failed to download PDF: {str(e)}")
