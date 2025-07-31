@@ -63,27 +63,39 @@ class LightweightRAG:
                 chunks.append(chunk)
         return chunks
     
-    def retrieve_relevant_chunks(self, query: str, chunks: List[str], top_k: int = 3) -> List[str]:
+    def retrieve_relevant_chunks(self, query: str, chunks: List[str], top_k: int = 5) -> List[str]:
         if not chunks:
             return []
         try:
+            # Extract key terms from question for better matching
+            key_terms = self.extract_key_terms(query)
+            
             # For large documents, pre-filter chunks by keyword matching
             if len(chunks) > 200:
-                query_words = set(query.lower().split())
                 scored_chunks = []
                 for i, chunk in enumerate(chunks):
-                    chunk_words = set(chunk.lower().split())
-                    keyword_score = len(query_words.intersection(chunk_words))
-                    if keyword_score > 0:
-                        scored_chunks.append((i, chunk, keyword_score))
+                    chunk_lower = chunk.lower()
+                    
+                    # Score based on key terms and question keywords
+                    score = 0
+                    for term in key_terms:
+                        if term in chunk_lower:
+                            score += chunk_lower.count(term) * 2
+                    
+                    # Boost score for insurance-specific terms
+                    insurance_terms = ['premium', 'coverage', 'waiting period', 'deductible', 'claim', 'policy', 'benefit', 'exclusion', 'limit']
+                    for term in insurance_terms:
+                        if term in chunk_lower:
+                            score += 1
+                    
+                    if score > 0:
+                        scored_chunks.append((i, chunk, score))
                 
-                # Sort by keyword score and take top 50 for TF-IDF
+                # Sort by score and take top 100 for TF-IDF
                 scored_chunks.sort(key=lambda x: x[2], reverse=True)
-                filtered_chunks = [chunk for _, chunk, _ in scored_chunks[:50]]
-                chunk_indices = [i for i, _, _ in scored_chunks[:50]]
+                filtered_chunks = [chunk for _, chunk, _ in scored_chunks[:100]]
             else:
                 filtered_chunks = chunks
-                chunk_indices = list(range(len(chunks)))
             
             if not filtered_chunks:
                 return chunks[:top_k]
@@ -95,19 +107,52 @@ class LightweightRAG:
             chunk_vectors = tfidf_matrix[:-1]
             similarities = cosine_similarity(query_vector, chunk_vectors).flatten()
             top_indices = np.argsort(similarities)[-top_k:][::-1]
-            relevant_chunks = [filtered_chunks[i] for i in top_indices if similarities[i] > 0.05]
-            return relevant_chunks if relevant_chunks else filtered_chunks[:2]
+            
+            # Return chunks with minimum similarity threshold
+            relevant_chunks = []
+            for i in top_indices:
+                if similarities[i] > 0.03:  # Lower threshold
+                    relevant_chunks.append(filtered_chunks[i])
+            
+            return relevant_chunks if relevant_chunks else filtered_chunks[:3]
+            
         except Exception as e:
             print(f"Retrieval error: {e}")
             return chunks[:top_k]
+    
+    def extract_key_terms(self, question: str) -> List[str]:
+        """Extract important terms from question"""
+        # Remove common question words
+        stop_words = {'what', 'is', 'the', 'are', 'does', 'do', 'how', 'when', 'where', 'why', 'which', 'who', 'this', 'that', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by'}
+        words = re.findall(r'\b\w+\b', question.lower())
+        key_terms = [word for word in words if word not in stop_words and len(word) > 2]
+        return key_terms
 
     async def generate_answer(self, question: str, context: str) -> str:
         """Generate single answer for one question"""
-        prompt = f"""Answer based on policy text. Be direct and specific.
+        
+        # Analyze question type for better prompting
+        question_lower = question.lower()
+        
+        if any(word in question_lower for word in ['grace period', 'waiting period', 'period']):
+            prompt_suffix = "State the exact time period (days/months/years) mentioned."
+        elif question_lower.startswith(('does', 'is', 'are')):
+            prompt_suffix = "Start with 'Yes' or 'No' then explain with specific details."
+        elif 'define' in question_lower or 'definition' in question_lower:
+            prompt_suffix = "Provide the exact definition as stated in the policy."
+        elif any(word in question_lower for word in ['how much', 'amount', 'limit', 'percentage']):
+            prompt_suffix = "Include specific amounts, percentages, or limits."
+        else:
+            prompt_suffix = "Be specific with numbers, conditions, and requirements."
+        
+        prompt = f"""Based on the insurance policy text, answer the question accurately and concisely.
 
-POLICY: {context}
+POLICY EXCERPT:
+{context}
 
 QUESTION: {question}
+
+INSTRUCTION: {prompt_suffix}
 
 ANSWER:"""
         
@@ -117,11 +162,17 @@ ANSWER:"""
                 prompt,
                 generation_config=genai.types.GenerationConfig(
                     temperature=0,
-                    max_output_tokens=120,
+                    max_output_tokens=130,
                     candidate_count=1
                 )
             )
-            return response.text.strip()
+            answer = response.text.strip()
+            
+            # Clean up common LLM artifacts
+            answer = re.sub(r'^(Answer:|A:)\s*', '', answer)
+            answer = re.sub(r'^Based on.*?policy,?\s*', '', answer, flags=re.IGNORECASE)
+            
+            return answer
         except Exception as e:
             print(f"Generation error: {e}")
             return "Unable to process this question."
@@ -160,15 +211,22 @@ async def run_analysis(request: QueryRequest, token: str = Depends(verify_token)
             if not chunks:
                 raise HTTPException(status_code=400, detail="No text could be extracted from PDF")
 
-        # Process questions sequentially for reliability
+        # Process questions with better context
         answers = []
         for i, question in enumerate(request.questions):
             try:
-                relevant_chunks = rag_system.retrieve_relevant_chunks(question, chunks)
-                context = "\n\n".join(relevant_chunks[:2])  # Use top 2 chunks only
+                relevant_chunks = rag_system.retrieve_relevant_chunks(question, chunks, top_k=5)
+                
+                # Use more context but keep it focused
+                context = "\n\n".join(relevant_chunks[:3])
+                
+                # If context is too short, add more chunks
+                if len(context) < 500 and len(relevant_chunks) > 3:
+                    context = "\n\n".join(relevant_chunks[:4])
+                
                 answer = await rag_system.generate_answer(question, context)
                 answers.append(answer)
-                print(f"Processed question {i+1}/{len(request.questions)}")
+                print(f"Processed question {i+1}/{len(request.questions)}: {len(context)} chars context")
             except Exception as e:
                 print(f"Error processing question {i+1}: {e}")
                 answers.append("Unable to process this question.")
