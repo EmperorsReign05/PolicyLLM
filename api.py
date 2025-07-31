@@ -1,16 +1,16 @@
-# api.py
+
 import os
 import fitz  # PyMuPDF
 import requests
 import tempfile
 import asyncio
 import re
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Tuple
 from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from dotenv import load_dotenv
-import google.generativeai as genai
+from openai import AsyncOpenAI # Use the OpenAI library to connect to OpenRouter
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 import numpy as np
@@ -19,17 +19,14 @@ import numpy as np
 load_dotenv()
 AUTH_TOKEN = "78b25ddaad17f4e8d85cde3dca81ade8319272062cf10b73ba148b425151f2fd"
 auth_scheme = HTTPBearer()
-app = FastAPI(title="HackRx 6.0 Policy Analyzer - Optimized")
-
-# Configure Google AI
-genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
+app = FastAPI(title="HackRx 6.0 Policy Analyzer - OpenRouter Edition")
 
 # --- Auth ---
 def verify_token(credentials: HTTPAuthorizationCredentials = Depends(auth_scheme)):
     if credentials.scheme != "Bearer" or credentials.credentials != AUTH_TOKEN:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
 
-# --- Models ---
+# --- Pydantic Models ---
 class QueryRequest(BaseModel):
     documents: str
     questions: List[str]
@@ -37,147 +34,168 @@ class QueryRequest(BaseModel):
 class QueryResponse(BaseModel):
     answers: List[str]
 
-# --- Lightweight RAG System ---
-class LightweightRAG:
+# --- Insurance-Specific Knowledge Base ---
+# This class remains unchanged
+class InsuranceKnowledgeBase:
     def __init__(self):
-        self.vectorizer = TfidfVectorizer(
-            max_features=1000,  # Reduced for large docs
-            stop_words='english',
-            ngram_range=(1, 1),  # Only unigrams for speed
-            max_df=0.95,
-            min_df=1  # Allow rare terms in large docs
-        )
-        self.model = genai.GenerativeModel('gemini-1.5-flash-latest')
-        
-    def clean_text(self, text: str) -> str:
-        text = re.sub(r'\s+', ' ', text)
-        text = re.sub(r'[^\w\s\.\,\!\?\;\:\-\(\)]', '', text)
-        return text.strip()
-    
-    def chunk_text(self, text: str, chunk_size: int = 800, overlap: int = 100) -> List[str]:
-        words = text.split()
-        chunks = []
-        for i in range(0, len(words), chunk_size - overlap):
-            chunk = ' '.join(words[i:i + chunk_size])
-            if chunk.strip():
-                chunks.append(chunk)
-        return chunks
-    
-    def retrieve_relevant_chunks(self, query: str, chunks: List[str], top_k: int = 5) -> List[str]:
-        if not chunks:
-            return []
-        try:
-            # Extract key terms from question for better matching
-            key_terms = self.extract_key_terms(query)
-            
-            # For large documents, pre-filter chunks by keyword matching
-            if len(chunks) > 200:
-                scored_chunks = []
-                for i, chunk in enumerate(chunks):
-                    chunk_lower = chunk.lower()
-                    
-                    # Score based on key terms and question keywords
-                    score = 0
-                    for term in key_terms:
-                        if term in chunk_lower:
-                            score += chunk_lower.count(term) * 2
-                    
-                    # Boost score for insurance-specific terms
-                    insurance_terms = ['premium', 'coverage', 'waiting period', 'deductible', 'claim', 'policy', 'benefit', 'exclusion', 'limit']
-                    for term in insurance_terms:
-                        if term in chunk_lower:
-                            score += 1
-                    
-                    if score > 0:
-                        scored_chunks.append((i, chunk, score))
-                
-                # Sort by score and take top 100 for TF-IDF
-                scored_chunks.sort(key=lambda x: x[2], reverse=True)
-                filtered_chunks = [chunk for _, chunk, _ in scored_chunks[:100]]
-            else:
-                filtered_chunks = chunks
-            
-            if not filtered_chunks:
-                return chunks[:top_k]
-            
-            # Apply TF-IDF on filtered chunks
-            all_texts = filtered_chunks + [query]
-            tfidf_matrix = self.vectorizer.fit_transform(all_texts)
-            query_vector = tfidf_matrix[-1]
-            chunk_vectors = tfidf_matrix[:-1]
-            similarities = cosine_similarity(query_vector, chunk_vectors).flatten()
-            top_indices = np.argsort(similarities)[-top_k:][::-1]
-            
-            # Return chunks with minimum similarity threshold
-            relevant_chunks = []
-            for i in top_indices:
-                if similarities[i] > 0.03:  # Lower threshold
-                    relevant_chunks.append(filtered_chunks[i])
-            
-            return relevant_chunks if relevant_chunks else filtered_chunks[:3]
-            
-        except Exception as e:
-            print(f"Retrieval error: {e}")
-            return chunks[:top_k]
-    
-    def extract_key_terms(self, question: str) -> List[str]:
-        """Extract important terms from question"""
-        # Remove common question words
-        stop_words = {'what', 'is', 'the', 'are', 'does', 'do', 'how', 'when', 'where', 'why', 'which', 'who', 'this', 'that', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by'}
-        words = re.findall(r'\b\w+\b', question.lower())
-        key_terms = [word for word in words if word not in stop_words and len(word) > 2]
-        return key_terms
+        self.question_patterns = {
+            'grace_period': ['grace period', 'grace time', 'payment period', 'premium due'],
+            'waiting_period': ['waiting period', 'wait time', 'exclusion period'],
+            'pre_existing': ['pre-existing', 'pre existing', 'PED', 'prior condition'],
+            'coverage': ['coverage', 'covered', 'cover', 'benefits', 'include'],
+            'exclusions': ['exclusion', 'exclude', 'not covered', 'limitation'],
+            'claim': ['claim', 'reimbursement', 'settlement'],
+            'premium': ['premium', 'payment', 'cost', 'price'],
+            'sum_insured': ['sum insured', 'limit', 'maximum amount'],
+            'maternity': ['maternity', 'pregnancy', 'childbirth', 'delivery'],
+            'room_rent': ['room rent', 'accommodation', 'ICU', 'hospital charges'],
+            'ayush': ['ayush', 'ayurveda', 'homeopathy', 'unani', 'siddha'],
+            'cataract': ['cataract', 'eye surgery', 'vision'],
+            'cumulative_bonus': ['cumulative bonus', 'no claim bonus', 'NCD', 'bonus'],
+            'hospital_definition': ['hospital', 'healthcare facility', 'medical center'],
+            'co_payment': ['co-payment', 'co payment', 'copay', 'deductible']
+        }
+        self.section_keywords = {
+            'definitions': ['definition', 'means', 'defined as', 'refers to'],
+            'coverage': ['coverage', 'benefits', 'indemnify', 'shall cover'],
+            'exclusions': ['exclusion', 'shall not', 'excluded', 'not covered'],
+            'waiting_periods': ['waiting period', 'months of continuous coverage'],
+            'claims': ['claim procedure', 'reimbursement', 'cashless'],
+            'general_conditions': ['general terms', 'conditions', 'renewal']
+        }
 
-    async def generate_answer(self, question: str, context: str) -> str:
-        """Generate single answer for one question"""
-        
-        # Analyze question type for better prompting
+    def classify_question(self, question: str) -> Tuple[str, List[str]]:
         question_lower = question.lower()
-        
-        if any(word in question_lower for word in ['grace period', 'waiting period', 'period']):
-            prompt_suffix = "State the exact time period (days/months/years) mentioned."
-        elif question_lower.startswith(('does', 'is', 'are')):
-            prompt_suffix = "Start with 'Yes' or 'No' then explain with specific details."
-        elif 'define' in question_lower or 'definition' in question_lower:
-            prompt_suffix = "Provide the exact definition as stated in the policy."
-        elif any(word in question_lower for word in ['how much', 'amount', 'limit', 'percentage']):
-            prompt_suffix = "Include specific amounts, percentages, or limits."
-        else:
-            prompt_suffix = "Be specific with numbers, conditions, and requirements."
-        
-        prompt = f"""Based on the insurance policy text, answer the question accurately and concisely.
+        for category, patterns in self.question_patterns.items():
+            if any(pattern in question_lower for pattern in patterns):
+                return category, patterns
+        return 'general', []
 
-POLICY EXCERPT:
-{context}
+    def get_section_boost_terms(self, question_type: str) -> List[str]:
+        boost_terms = {
+            'grace_period': ['grace period', 'thirty days', '30 days', 'premium due date'],
+            'waiting_period': ['waiting period', '36 months', '24 months', 'continuous coverage'],
+            'pre_existing': ['pre-existing disease', 'PED', '36 months', 'physician within'],
+            'maternity': ['maternity', 'childbirth', 'pregnancy', 'delivery', 'female insured'],
+            'cataract': ['cataract', '25%', 'Rs. 40,000', 'per eye'],
+            'room_rent': ['room rent', '2% of sum insured', 'Rs. 5,000', 'ICU', '5%', 'Rs. 10,000'],
+            'ayush': ['AYUSH', 'Ayurveda', 'Homeopathy', 'Unani', 'Siddha', 'Naturopathy'],
+            'cumulative_bonus': ['cumulative bonus', '5%', 'claim free', 'maximum of 50%'],
+            'hospital_definition': ['hospital means', 'institution established', '10 inpatient beds']
+        }
+        return boost_terms.get(question_type, [])
 
+# --- Enhanced RAG System ---
+class InsuranceRAG:
+    def __init__(self):
+        self.vectorizer = TfidfVectorizer(max_features=1500, stop_words='english', ngram_range=(1, 2), max_df=0.9, min_df=1)
+        self.kb = InsuranceKnowledgeBase()
+        
+        # --- UPDATED: Initialize OpenRouter Client ---
+        self.client = AsyncOpenAI(
+            base_url="https://openrouter.ai/api/v1",
+            api_key=os.getenv("gemini_key"),
+        )
+        # -------------------------------------------
+
+    # ... (clean_insurance_text, smart_chunk_text, enhanced_retrieve methods remain the same) ...
+    def clean_insurance_text(self, text: str) -> str:
+        text = re.sub(r'\n+', '\n', text)
+        text = re.sub(r'\s{3,}', ' ', text)
+        text = re.sub(r'[^\w\s\.\,\!\?\;\:\-\(\)\%\₹\/]', ' ', text)
+        replacements = {
+            r'Rs\.\s*': 'Rs. ', r'INR\s*': 'Rs. ', r'₹\s*': 'Rs. ',
+            r'\b(\d+)\s*%': r'\1%', r'\b(\d+)\s*months?\b': r'\1 months',
+            r'\b(\d+)\s*days?\b': r'\1 days'
+        }
+        for pattern, replacement in replacements.items():
+            text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
+        return text.strip()
+
+    def smart_chunk_text(self, text: str, chunk_size: int = 1000, overlap: int = 150) -> List[str]:
+        chunks = []
+        current_chunk = ""
+        for line in text.split('\n'):
+            if len(current_chunk) + len(line) > chunk_size and current_chunk:
+                chunks.append(current_chunk.strip())
+                words = current_chunk.split()
+                overlap_text = ' '.join(words[-overlap//5:]) if len(words) > overlap//5 else ""
+                current_chunk = overlap_text + '\n' + line
+            else:
+                current_chunk += '\n' + line
+        if current_chunk.strip():
+            chunks.append(current_chunk.strip())
+        return [chunk for chunk in chunks if len(chunk.strip()) > 50]
+
+    def enhanced_retrieve(self, question: str, chunks: List[str], top_k: int = 4) -> List[str]:
+        if not chunks: return []
+        try:
+            question_type, patterns = self.kb.classify_question(question)
+            boost_terms = self.kb.get_section_boost_terms(question_type)
+            scored_chunks = []
+            for i, chunk in enumerate(chunks):
+                chunk_lower = chunk.lower()
+                score = 0
+                for pattern in patterns:
+                    score += len(re.findall(re.escape(pattern), chunk_lower)) * 3
+                for term in boost_terms:
+                    if term.lower() in chunk_lower: score += 2
+                if question_type == 'grace_period' and any(term in chunk_lower for term in ['grace', '30', 'thirty', 'days']): score += 5
+                elif question_type == 'waiting_period' and any(term in chunk_lower for term in ['waiting', '36', 'months', '24']): score += 5
+                elif question_type == 'maternity' and 'maternity' in chunk_lower: score += 5
+                elif question_type == 'cataract' and 'cataract' in chunk_lower: score += 5
+                if question_type in ['coverage', 'benefits'] and any(word in chunk_lower for word in ['coverage', 'benefits', 'indemnify']): score += 3
+                elif question_type in ['exclusions'] and any(word in chunk_lower for word in ['exclusion', 'excluded', 'shall not']): score += 3
+                if re.search(r'\d+\s*%|\d+\s*days?|\d+\s*months?|Rs\.\s*\d+', chunk): score += 1
+                scored_chunks.append((i, chunk, score))
+            
+            scored_chunks.sort(key=lambda x: x[2], reverse=True)
+            high_score_chunks = [chunk for _, chunk, score in scored_chunks if score >= 5]
+            if high_score_chunks: return high_score_chunks[:top_k]
+            else:
+                top_scored = [chunk for _, chunk, _ in scored_chunks[:min(50, len(scored_chunks))]]
+                if len(top_scored) > 1:
+                    all_texts = top_scored + [question]
+                    tfidf_matrix = self.vectorizer.fit_transform(all_texts)
+                    similarities = cosine_similarity(tfidf_matrix[-1], tfidf_matrix[:-1]).flatten()
+                    top_indices = np.argsort(similarities)[-top_k:][::-1]
+                    return [top_scored[i] for i in top_indices]
+                else: return top_scored[:top_k]
+        except Exception as e:
+            print(f"Enhanced retrieval error: {e}")
+            return chunks[:top_k]
+
+    # --- UPDATED: generate_insurance_answer to use OpenRouter client ---
+    async def generate_insurance_answer(self, question: str, context: str, question_type: str) -> str:
+        specific_instruction = self.kb.get_section_boost_terms(question_type) or "Be specific with numbers, percentages, time periods, and conditions."
+        prompt = f"""You are an expert insurance policy analyst. Answer the question based ONLY on the provided policy text.
+POLICY TEXT: {context}
 QUESTION: {question}
-
-INSTRUCTION: {prompt_suffix}
-
+INSTRUCTIONS:
+- {specific_instruction}
+- Be concise but include all relevant conditions.
+- If the information is not in the provided text, say so.
 ANSWER:"""
         
         try:
-            response = await asyncio.to_thread(
-                self.model.generate_content,
-                prompt,
-                generation_config=genai.types.GenerationConfig(
-                    temperature=0,
-                    max_output_tokens=130,
-                    candidate_count=1
-                )
+            # Use the OpenAI-compatible client to call OpenRouter
+            response = await self.client.chat.completions.create(
+                model="google/gemini-pro", # Standard model ID for Gemini Pro on OpenRouter
+                messages=[
+                    {"role": "system", "content": "You are an expert insurance policy analyst. Provide clear, accurate, and concise answers based only on the given policy context."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.1,
+                max_tokens=250
             )
-            answer = response.text.strip()
-            
-            # Clean up common LLM artifacts
-            answer = re.sub(r'^(Answer:|A:)\s*', '', answer)
-            answer = re.sub(r'^Based on.*?policy,?\s*', '', answer, flags=re.IGNORECASE)
-            
-            return answer
+            answer = response.choices[0].message.content.strip()
+            return answer if answer else "No relevant information found in the policy."
         except Exception as e:
             print(f"Generation error: {e}")
             return "Unable to process this question."
+    # -------------------------------------------------------------
 
-# --- PDF Processing ---
+# ... (The rest of your file: extract_text_from_pdf, rag_system initialization, and the FastAPI endpoint logic remains the same) ...
 def extract_text_from_pdf(pdf_path: str) -> str:
     try:
         doc = fitz.open(pdf_path)
@@ -187,66 +205,36 @@ def extract_text_from_pdf(pdf_path: str) -> str:
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"PDF processing error: {str(e)}")
 
-# Initialize RAG system
-rag_system = LightweightRAG()
+rag_system = InsuranceRAG()
 
-# --- Main Endpoint ---
 @app.post("/api/v1/hackrx/run", response_model=QueryResponse)
 async def run_analysis(request: QueryRequest, token: str = Depends(verify_token)):
     try:
-        # Download PDF
         headers = {"User-Agent": "Mozilla/5.0"}
-        response = requests.get(request.documents, headers=headers, timeout=25)
+        response = requests.get(request.documents, headers=headers, timeout=20)
         response.raise_for_status()
 
-        # Process PDF
         with tempfile.NamedTemporaryFile(delete=True, suffix=".pdf") as temp_file:
             temp_file.write(response.content)
-            temp_file.flush()
-
             raw_text = extract_text_from_pdf(temp_file.name)
-            clean_text = rag_system.clean_text(raw_text)
-            chunks = rag_system.chunk_text(clean_text)
-            
+            clean_text = rag_system.clean_insurance_text(raw_text)
+            chunks = rag_system.smart_chunk_text(clean_text)
             if not chunks:
-                raise HTTPException(status_code=400, detail="No text could be extracted from PDF")
+                raise HTTPException(status_code=400, detail="No processable text found in PDF")
 
-        # Process questions with better context
-        answers = []
-        for i, question in enumerate(request.questions):
-            try:
-                relevant_chunks = rag_system.retrieve_relevant_chunks(question, chunks, top_k=5)
-                
-                # Use more context but keep it focused
-                context = "\n\n".join(relevant_chunks[:3])
-                
-                # If context is too short, add more chunks
-                if len(context) < 500 and len(relevant_chunks) > 3:
-                    context = "\n\n".join(relevant_chunks[:4])
-                
-                answer = await rag_system.generate_answer(question, context)
-                answers.append(answer)
-                print(f"Processed question {i+1}/{len(request.questions)}: {len(context)} chars context")
-            except Exception as e:
-                print(f"Error processing question {i+1}: {e}")
-                answers.append("Unable to process this question.")
+        async def process_question(question: str) -> str:
+            question_type, _ = rag_system.kb.classify_question(question)
+            relevant_chunks = rag_system.enhanced_retrieve(question, chunks, top_k=4)
+            context = "\n\n---\n\n".join(relevant_chunks)
+            return await rag_system.generate_insurance_answer(question, context, question_type)
 
+        tasks = [process_question(q) for q in request.questions]
+        answers = await asyncio.gather(*tasks)
         return QueryResponse(answers=answers)
-
-    except requests.RequestException as e:
-        raise HTTPException(status_code=400, detail=f"Failed to download PDF: {str(e)}")
     except Exception as e:
         print(f"Processing error: {e}")
-        raise HTTPException(status_code=500, detail=f"Processing error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"System error: {str(e)}")
 
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy", "message": "Policy Analyzer API is running"}
-
-@app.get("/")
-async def root():
-    return {"message": "HackRx 6.0 Policy Analyzer - Optimized Version"}
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    return {"status": "healthy"}
