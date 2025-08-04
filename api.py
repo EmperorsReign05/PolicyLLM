@@ -558,7 +558,7 @@ async def run_analysis(request: QueryRequest, token: str = Depends(verify_token)
                 response = requests.get(
                     request.documents, 
                     headers=headers, 
-                    timeout=60,
+                    timeout=30,
                     stream=True
                 )
                 response.raise_for_status()
