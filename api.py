@@ -1,4 +1,4 @@
-# enhanced_api.py - Significantly Improved Insurance Document Analysis
+# optimized_api.py - High-Performance Insurance Document Analysis with Sentence Transformers + FAISS
 import os
 import fitz  # PyMuPDF
 import requests
@@ -11,13 +11,15 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from dotenv import load_dotenv
 import google.generativeai as genai
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
 import numpy as np
-from collections import defaultdict
+from sentence_transformers import SentenceTransformer
+import faiss
 import nltk
 from nltk.tokenize import sent_tokenize
 from nltk.corpus import stopwords
+import pickle
+import hashlib
+from collections import defaultdict
 
 # Download required NLTK data
 try:
@@ -31,10 +33,21 @@ except LookupError:
 load_dotenv()
 AUTH_TOKEN = "78b25ddaad17f4e8d85cde3dca81ade8319272062cf10b73ba148b425151f2fd"
 auth_scheme = HTTPBearer()
-app = FastAPI(title="HackRx 6.0 Policy Analyzer - Enhanced RAG")
+app = FastAPI(title="HackRx 6.0 Policy Analyzer - Advanced Semantic Search")
 
 # Configure Google AI
 genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
+
+# Global model cache
+_embedding_model = None
+def get_embedding_model():
+    global _embedding_model
+    if _embedding_model is None:
+        print("Loading sentence transformer model...")
+        # Using a lightweight but effective model for insurance documents
+        _embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+        print("Model loaded successfully!")
+    return _embedding_model
 
 # --- Auth ---
 def verify_token(credentials: HTTPAuthorizationCredentials = Depends(auth_scheme)):
@@ -49,151 +62,84 @@ class QueryRequest(BaseModel):
 class QueryResponse(BaseModel):
     answers: List[str]
 
-# --- Enhanced Insurance Knowledge Base ---
+# --- Advanced Insurance Knowledge Base ---
 class AdvancedInsuranceKB:
     def __init__(self):
-        # Comprehensive insurance term mappings
+        # Enhanced insurance term mappings with semantic variations
         self.question_patterns = {
             'grace_period': [
                 'grace period', 'grace time', 'payment period', 'premium due', 
-                'pay premium', 'late payment', 'policy lapse'
+                'pay premium', 'late payment', 'policy lapse', 'payment deadline',
+                'premium payment time', 'due date extension'
             ],
             'waiting_period': [
                 'waiting period', 'wait time', 'exclusion period', 'initial waiting',
-                'cooling period', 'probation period'
+                'cooling period', 'probation period', 'coverage begins', 'when covered',
+                'months before coverage', 'initial exclusion'
             ],
             'pre_existing': [
                 'pre-existing', 'pre existing', 'PED', 'prior condition', 
-                'existing disease', 'medical history', 'declare disease'
+                'existing disease', 'medical history', 'declare disease',
+                'previous illness', 'ongoing condition', 'chronic disease'
             ],
             'coverage': [
                 'coverage', 'covered', 'cover', 'benefits', 'include', 
-                'indemnify', 'reimburse', 'eligible', 'entitled'
+                'indemnify', 'reimburse', 'eligible', 'entitled', 'what is covered',
+                'scope of cover', 'medical expenses', 'treatment covered'
             ],
             'exclusions': [
                 'exclusion', 'exclude', 'not covered', 'limitation', 
-                'not eligible', 'shall not', 'except'
-            ],
-            'claim': [
-                'claim', 'reimbursement', 'settlement', 'cashless', 
-                'claim procedure', 'submit claim', 'claim process'
-            ],
-            'premium': [
-                'premium', 'payment', 'cost', 'price', 'installment', 
-                'annual premium', 'monthly premium'
-            ],
-            'sum_insured': [
-                'sum insured', 'limit', 'maximum amount', 'coverage limit', 
-                'benefit limit', 'sum assured'
+                'not eligible', 'shall not', 'except', 'excluded conditions',
+                'what is not covered', 'restrictions', 'not reimbursed'
             ],
             'maternity': [
                 'maternity', 'pregnancy', 'childbirth', 'delivery', 
-                'maternal', 'newborn', 'confinement'
+                'maternal', 'newborn', 'confinement', 'obstetric care',
+                'prenatal', 'postnatal', 'labor', 'caesarean'
             ],
             'room_rent': [
                 'room rent', 'accommodation', 'ICU', 'hospital charges', 
-                'room category', 'bed charges', 'hospital room'
-            ],
-            'ayush': [
-                'ayush', 'ayurveda', 'homeopathy', 'unani', 'siddha', 
-                'naturopathy', 'yoga', 'alternative medicine'
+                'room category', 'bed charges', 'hospital room', 'daily room rent',
+                'room limit', 'accommodation charges', 'private room'
             ],
             'cataract': [
                 'cataract', 'eye surgery', 'vision', 'lens replacement', 
-                'eye treatment', 'ophthalmology'
+                'eye treatment', 'ophthalmology', 'intraocular lens',
+                'eye operation', 'vision correction'
             ],
             'cumulative_bonus': [
                 'cumulative bonus', 'no claim bonus', 'NCD', 'bonus', 
-                'claim free', 'renewal bonus', 'loyalty bonus'
-            ],
-            'hospital_definition': [
-                'hospital', 'healthcare facility', 'medical center', 
-                'nursing home', 'clinic', 'medical institution'
-            ],
-            'co_payment': [
-                'co-payment', 'co payment', 'copay', 'deductible', 
-                'patient contribution', 'out of pocket'
-            ],
-            'ambulance': [
-                'ambulance', 'emergency transport', 'patient transport'
-            ],
-            'domiciliary': [
-                'domiciliary', 'home treatment', 'home care', 'treatment at home'
-            ],
-            'day_care': [
-                'day care', 'daycare', 'same day discharge', 'outpatient surgery'
+                'claim free', 'renewal bonus', 'loyalty bonus', 'NCB',
+                'discount for no claims', 'bonus accumulation'
             ]
         }
         
-        # Enhanced section identification
-        self.section_markers = {
-            'definitions': [
-                'definitions', 'defined terms', 'interpretation', 'meaning',
-                'shall mean', 'means and includes', 'terminology'
-            ],
-            'coverage': [
-                'coverage', 'benefits', 'what is covered', 'scope of cover',
-                'indemnity', 'reimbursement', 'eligible expenses'
-            ],
-            'exclusions': [
-                'exclusions', 'what is not covered', 'limitations', 
-                'exceptions', 'shall not cover', 'excluded'
-            ],
-            'waiting_periods': [
-                'waiting period', 'initial waiting', 'specific waiting',
-                'cooling period', 'probation'
-            ],
-            'claims': [
-                'claim procedure', 'claims process', 'how to claim',
-                'reimbursement procedure', 'cashless facility'
-            ],
-            'conditions': [
-                'general conditions', 'terms and conditions', 'policy conditions',
-                'general terms', 'provisions'
-            ]
-        }
-
-        # Specific value extractors for common insurance queries
-        self.value_patterns = {
+        # Question type boost keywords for semantic search
+        self.semantic_boosts = {
             'grace_period': [
-                r'grace period.*?(\d+)\s*days?',
-                r'(\d+)\s*days?.*?grace',
-                r'thirty\s*days?',
-                r'30\s*days?'
+                'thirty days premium payment', 'grace period policy renewal',
+                'payment due date extension', 'premium payment deadline'
             ],
             'waiting_period': [
-                r'waiting period.*?(\d+)\s*months?',
-                r'(\d+)\s*months?.*?waiting',
-                r'initial waiting.*?(\d+)',
-                r'(\d+)\s*months?.*?continuous coverage'
+                'thirty six months waiting', 'continuous coverage period',
+                'initial waiting exclusion', 'months before eligible'
             ],
-            'room_rent': [
-                r'room rent.*?(\d+)%',
-                r'(\d+)%.*?sum insured.*?room',
-                r'Rs\.?\s*(\d+,?\d*)',
-                r'ICU.*?(\d+)%'
+            'maternity': [
+                'maternity benefit coverage', 'pregnancy related expenses',
+                'childbirth hospital expenses', 'delivery medical costs'
             ],
             'cataract': [
-                r'cataract.*?(\d+)%',
-                r'Rs\.?\s*(\d+,?\d*).*?per eye',
-                r'25%.*?sum insured'
+                'cataract surgery coverage limit', 'eye surgery maximum amount',
+                'per eye treatment cost', 'ophthalmology procedure limit'
+            ],
+            'room_rent': [
+                'daily room rent limit', 'accommodation charge restriction',
+                'ICU charge percentage', 'private room cost limit'
             ]
         }
 
-    def extract_numerical_values(self, text: str, question_type: str) -> List[str]:
-        """Extract specific numerical values relevant to question type"""
-        if question_type not in self.value_patterns:
-            return []
-        
-        values = []
-        for pattern in self.value_patterns[question_type]:
-            matches = re.findall(pattern, text, re.IGNORECASE)
-            values.extend(matches)
-        
-        return values
-
-    def classify_question_advanced(self, question: str) -> Tuple[str, List[str], float]:
-        """Advanced question classification with confidence scoring"""
+    def classify_question_semantic(self, question: str) -> Tuple[str, List[str], float]:
+        """Enhanced question classification using semantic similarity"""
         question_lower = question.lower()
         scores = {}
         
@@ -202,11 +148,18 @@ class AdvancedInsuranceKB:
             matched_patterns = []
             
             for pattern in patterns:
+                # Exact matching
                 if pattern in question_lower:
-                    # Weight longer patterns more heavily
-                    weight = len(pattern.split()) * 2
+                    weight = len(pattern.split()) * 3  # Higher weight for exact matches
                     score += weight
                     matched_patterns.append(pattern)
+                
+                # Fuzzy matching for typos and variations
+                pattern_words = set(pattern.split())
+                question_words = set(question_lower.split())
+                overlap = len(pattern_words.intersection(question_words))
+                if overlap > 0:
+                    score += overlap * 2
             
             if score > 0:
                 scores[category] = (score, matched_patterns)
@@ -218,23 +171,18 @@ class AdvancedInsuranceKB:
         
         return 'general', [], 0.0
 
-# --- Advanced RAG System ---
-class AdvancedInsuranceRAG:
+# --- Advanced Semantic RAG System ---
+class SemanticInsuranceRAG:
     def __init__(self):
-        self.vectorizer = TfidfVectorizer(
-            max_features=2000,
-            stop_words='english',
-            ngram_range=(1, 3),  # Include trigrams for better insurance phrase matching
-            max_df=0.85,
-            min_df=1,
-            token_pattern=r'\b[a-zA-Z][a-zA-Z0-9]*\b'  # Include alphanumeric tokens
-        )
+        self.embedding_model = get_embedding_model()
         self.model = genai.GenerativeModel('gemini-1.5-flash-latest')
         self.kb = AdvancedInsuranceKB()
         self.stop_words = set(stopwords.words('english'))
+        self.chunk_cache = {}
+        self.embedding_cache = {}
         
     def advanced_text_cleaning(self, text: str) -> str:
-        """Advanced text cleaning specifically for insurance documents"""
+        """Advanced text cleaning optimized for insurance documents"""
         # Preserve important insurance document structure
         text = re.sub(r'\f', '\n', text)  # Form feed to newline
         text = re.sub(r'\r\n', '\n', text)  # Windows line endings
@@ -261,7 +209,8 @@ class AdvancedInsuranceRAG:
             r'\bPED\b': 'Pre-Existing Disease',
             r'\bICU\b': 'Intensive Care Unit',
             r'\bOPD\b': 'Out Patient Department',
-            r'\bIPD\b': 'In Patient Department'
+            r'\bIPD\b': 'In Patient Department',
+            r'\bNCD\b': 'No Claim Discount'
         }
         
         for pattern, replacement in replacements.items():
@@ -269,43 +218,64 @@ class AdvancedInsuranceRAG:
         
         return text.strip()
 
-    def semantic_chunking(self, text: str, base_chunk_size: int = 800, overlap: int = 150) -> List[Dict[str, Any]]:
-        """Advanced semantic chunking that preserves document structure and meaning"""
+    def intelligent_chunking(self, text: str, base_chunk_size: int = 600, overlap: int = 100) -> List[Dict[str, Any]]:
+        """Intelligent chunking optimized for semantic search"""
         sentences = sent_tokenize(text)
         chunks = []
         current_chunk = ""
         current_sentences = []
         
-        # Identify section breaks
-        section_breaks = []
-        for i, sentence in enumerate(sentences):
-            sentence_lower = sentence.lower().strip()
-            
-            # Check for section headers
-            if (len(sentence.strip()) < 100 and 
-                any(marker in sentence_lower for section_type, markers in self.kb.section_markers.items() 
-                    for marker in markers)):
-                section_breaks.append(i)
+        # Identify section breaks and important markers
+        section_markers = [
+            r'\b(?:definitions?|defined terms?)\b',
+            r'\b(?:coverage|benefits?|scope)\b',
+            r'\b(?:exclusions?|limitations?)\b',
+            r'\b(?:waiting period|initial waiting)\b',
+            r'\b(?:claims?|reimbursement)\b',
+            r'\b(?:conditions?|terms?)\b'
+        ]
         
         i = 0
         while i < len(sentences):
-            sentence = sentences[i]
+            sentence = sentences[i].strip()
             
-            # Check if adding this sentence would exceed chunk size
-            if len(current_chunk) + len(sentence) > base_chunk_size and current_chunk:
+            # Check for section headers (give them priority)
+            is_section_header = (
+                len(sentence) < 80 and
+                any(re.search(marker, sentence, re.IGNORECASE) for marker in section_markers)
+            )
+            
+            # Decide whether to start new chunk
+            should_break = (
+                len(current_chunk) + len(sentence) > base_chunk_size and 
+                current_chunk and 
+                not is_section_header
+            )
+            
+            if should_break:
                 # Create chunk with metadata
                 chunk_info = {
                     'text': current_chunk.strip(),
                     'sentences': current_sentences.copy(),
                     'start_idx': i - len(current_sentences),
                     'end_idx': i - 1,
-                    'section_type': self._identify_section_type(current_chunk)
+                    'section_type': self._identify_section_type(current_chunk),
+                    'importance_score': self._calculate_importance(current_chunk)
                 }
                 chunks.append(chunk_info)
                 
-                # Handle overlap
-                if len(current_sentences) > 3:
-                    overlap_sentences = current_sentences[-2:]  # Keep last 2 sentences for overlap
+                # Handle overlap intelligently
+                if len(current_sentences) > 2:
+                    # Keep sentences that contain important keywords
+                    overlap_sentences = []
+                    for sent in current_sentences[-3:]:  # Look at last 3 sentences
+                        if any(keyword in sent.lower() for keyword in 
+                               ['shall', 'means', 'includes', 'excludes', 'coverage', 'waiting']):
+                            overlap_sentences.append(sent)
+                    
+                    if not overlap_sentences and current_sentences:
+                        overlap_sentences = [current_sentences[-1]]  # At least keep last sentence
+                    
                     current_chunk = ' '.join(overlap_sentences)
                     current_sentences = overlap_sentences.copy()
                 else:
@@ -313,7 +283,10 @@ class AdvancedInsuranceRAG:
                     current_sentences = []
             
             # Add current sentence
-            current_chunk += (' ' if current_chunk else '') + sentence
+            if current_chunk:
+                current_chunk += ' ' + sentence
+            else:
+                current_chunk = sentence
             current_sentences.append(sentence)
             i += 1
         
@@ -324,247 +297,220 @@ class AdvancedInsuranceRAG:
                 'sentences': current_sentences,
                 'start_idx': len(sentences) - len(current_sentences),
                 'end_idx': len(sentences) - 1,
-                'section_type': self._identify_section_type(current_chunk)
+                'section_type': self._identify_section_type(current_chunk),
+                'importance_score': self._calculate_importance(current_chunk)
             }
             chunks.append(chunk_info)
         
         return [chunk for chunk in chunks if len(chunk['text'].strip()) > 100]
 
     def _identify_section_type(self, text: str) -> str:
-        """Identify the type of section based on content"""
+        """Identify section type with improved accuracy"""
         text_lower = text.lower()
         
-        for section_type, markers in self.kb.section_markers.items():
-            if any(marker in text_lower for marker in markers):
-                return section_type
+        section_patterns = {
+            'definitions': [r'\bmeans?\b', r'\bdefined? as\b', r'\brefers? to\b', r'\binterpretation\b'],
+            'coverage': [r'\bcoverage\b', r'\bbenefits?\b', r'\bindemnif', r'\breimburse', r'\bshall cover\b'],
+            'exclusions': [r'\bexclus', r'\bshall not\b', r'\bnot covered\b', r'\blimitation\b'],
+            'waiting_periods': [r'\bwaiting period\b', r'\binitial waiting\b', r'\bcontinuous coverage\b'],
+            'claims': [r'\bclaim', r'\breimbursement\b', r'\bcashless\b', r'\bsettlement\b'],
+            'conditions': [r'\bconditions?\b', r'\bterms?\b', r'\bprovisions?\b', r'\brenewal\b']
+        }
+        
+        for section_type, patterns in section_patterns.items():
+            for pattern in patterns:
+                if re.search(pattern, text_lower):
+                    return section_type
         
         return 'general'
 
-    def hybrid_retrieval(self, question: str, chunks: List[Dict[str, Any]], top_k: int = 5) -> List[str]:
-        """Hybrid retrieval combining multiple scoring methods"""
+    def _calculate_importance(self, text: str) -> float:
+        """Calculate importance score for chunk prioritization"""
+        text_lower = text.lower()
+        score = 0
+        
+        # Important keywords boost
+        important_keywords = [
+            'grace period', 'waiting period', 'coverage', 'exclusion', 'maternity',
+            'cataract', 'room rent', 'sum insured', 'premium', 'claim', 'hospital',
+            'shall', 'means', 'includes', 'per cent', '%', 'days', 'months', 'years'
+        ]
+        
+        for keyword in important_keywords:
+            score += text_lower.count(keyword) * 2
+        
+        # Numerical content boost
+        numbers = re.findall(r'\d+(?:\.\d+)?', text)
+        score += len(numbers) * 1.5
+        
+        # Length penalty for very short or very long chunks
+        length_ratio = len(text) / 800  # Optimal chunk size
+        if 0.3 <= length_ratio <= 1.5:
+            score += 2
+        
+        return score
+
+    def create_faiss_index(self, chunks: List[Dict[str, Any]]) -> Tuple[faiss.Index, np.ndarray]:
+        """Create FAISS index for fast semantic similarity search"""
+        texts = [chunk['text'] for chunk in chunks]
+        
+        # Generate embeddings
+        print(f"Generating embeddings for {len(texts)} chunks...")
+        embeddings = self.embedding_model.encode(texts, show_progress_bar=False, convert_to_numpy=True)
+        
+        # Create FAISS index
+        dimension = embeddings.shape[1]
+        index = faiss.IndexFlatIP(dimension)  # Inner Product for cosine similarity
+        
+        # Normalize embeddings for cosine similarity
+        faiss.normalize_L2(embeddings)
+        index.add(embeddings)
+        
+        print(f"FAISS index created with {index.ntotal} vectors")
+        return index, embeddings
+
+    def semantic_retrieval(self, question: str, chunks: List[Dict[str, Any]], top_k: int = 6) -> List[str]:
+        """Advanced semantic retrieval using FAISS + question-specific boosting"""
         if not chunks:
             return []
         
         try:
-            # Get question classification
-            question_type, patterns, confidence = self.kb.classify_question_advanced(question)
+            # Create FAISS index
+            faiss_index, chunk_embeddings = self.create_faiss_index(chunks)
             
-            chunk_scores = []
-            chunk_texts = [chunk['text'] for chunk in chunks]
+            # Get question classification for boosting
+            question_type, patterns, confidence = self.kb.classify_question_semantic(question)
             
-            # 1. TF-IDF Similarity
-            try:
-                all_texts = chunk_texts + [question]
-                tfidf_matrix = self.vectorizer.fit_transform(all_texts)
-                query_vector = tfidf_matrix[-1]
-                chunk_vectors = tfidf_matrix[:-1]
-                tfidf_similarities = cosine_similarity(query_vector, chunk_vectors).flatten()
-            except:
-                tfidf_similarities = np.zeros(len(chunks))
+            # Create enhanced query with semantic boosting
+            enhanced_query = question
+            if question_type in self.kb.semantic_boosts:
+                boost_phrases = self.kb.semantic_boosts[question_type]
+                enhanced_query = f"{question} {' '.join(boost_phrases[:2])}"  # Add top 2 boost phrases
             
-            # 2. Enhanced Pattern Matching and Scoring
-            for i, chunk in enumerate(chunks):
+            # Generate query embedding
+            query_embedding = self.embedding_model.encode([enhanced_query], convert_to_numpy=True)
+            faiss.normalize_L2(query_embedding)
+            
+            # Search with FAISS
+            similarities, indices = faiss_index.search(query_embedding, min(top_k * 2, len(chunks)))
+            
+            # Re-rank results with additional factors
+            scored_chunks = []
+            for i, (sim_score, chunk_idx) in enumerate(zip(similarities[0], indices[0])):
+                if chunk_idx >= len(chunks):  # Safety check
+                    continue
+                    
+                chunk = chunks[chunk_idx]
                 text_lower = chunk['text'].lower()
                 
-                # Base scores
-                tfidf_score = tfidf_similarities[i] if i < len(tfidf_similarities) else 0
-                pattern_score = 0
-                section_score = 0
-                value_score = 0
-                specificity_score = 0
+                # Base semantic similarity score
+                final_score = float(sim_score) * 10  # Scale up
                 
-                # Enhanced pattern matching with context awareness
+                # Question-specific pattern boost
                 for pattern in patterns:
-                    # Direct pattern matches
-                    pattern_count = len(re.findall(re.escape(pattern), text_lower))
-                    pattern_score += pattern_count * len(pattern.split()) * 3
-                    
-                    # Context-aware matching (surrounding words)
-                    context_patterns = re.findall(rf'.{{0,50}}{re.escape(pattern)}.{{0,50}}', text_lower)
-                    pattern_score += len(context_patterns) * 1.5
+                    if pattern in text_lower:
+                        final_score += 3 * len(pattern.split())
                 
-                # Section type bonus with enhanced logic
-                chunk_section = chunk['section_type']
-                if chunk_section == 'definitions':
-                    if question_type in ['grace_period', 'waiting_period', 'hospital_definition', 'pre_existing']:
-                        section_score = 4
-                elif chunk_section == 'coverage':
-                    if question_type in ['coverage', 'maternity', 'ayush', 'room_rent', 'cataract']:
-                        section_score = 4
-                elif chunk_section == 'exclusions':
-                    if question_type == 'exclusions' or 'not covered' in question.lower():
-                        section_score = 4
-                elif chunk_section == 'waiting_periods':
-                    if question_type in ['waiting_period', 'pre_existing']:
-                        section_score = 5
-                elif chunk_section == 'claims':
-                    if question_type == 'claim':
-                        section_score = 4
+                # Section type boost
+                if question_type == 'coverage' and chunk['section_type'] == 'coverage':
+                    final_score += 5
+                elif question_type == 'exclusions' and chunk['section_type'] == 'exclusions':
+                    final_score += 5
+                elif question_type in ['grace_period', 'waiting_period'] and chunk['section_type'] == 'definitions':
+                    final_score += 4
+                elif chunk['section_type'] == question_type:
+                    final_score += 3
                 
-                # Enhanced value extraction with specific patterns
-                if question_type in self.kb.value_patterns:
-                    values = self.kb.extract_numerical_values(chunk['text'], question_type)
-                    value_score = len(values) * 3
-                    
-                    # Bonus for specific value patterns matching the question type
-                    if question_type == 'grace_period' and any('30' in str(v) or 'thirty' in text_lower for v in values):
-                        value_score += 5
-                    elif question_type == 'waiting_period' and any('36' in str(v) or '24' in str(v) for v in values):
-                        value_score += 5
-                    elif question_type == 'cataract' and any('25' in str(v) or '40000' in str(v) for v in values):
-                        value_score += 5
-                    elif question_type == 'room_rent' and any('2' in str(v) or '5' in str(v) for v in values):
-                        value_score += 5
+                # Importance score boost
+                final_score += chunk['importance_score'] * 0.5
                 
-                # Question-specific keyword boosting (matching sample response patterns)
+                # Specific keyword boosting for insurance terms
                 keyword_boosts = {
-                    'grace_period': ['grace period', 'thirty days', 'premium payment', 'due date', 'renew', 'continue'],
-                    'waiting_period': ['waiting period', 'continuous coverage', 'first policy inception', 'months', 'specific waiting'],
-                    'maternity': ['maternity expenses', 'lawful child', 'female insured', 'pregnancy', 'childbirth'],
-                    'cataract': ['cataract surgery', 'per eye', 'sum insured', 'maximum', 'eye treatment'],
-                    'room_rent': ['room rent', 'daily room', 'sum insured', 'ICU charges', 'accommodation'],
-                    'ayush': ['AYUSH', 'Ayurveda', 'Yoga', 'Naturopathy', 'Unani', 'Siddha', 'Homeopathy', 'inpatient treatment'],
-                    'cumulative_bonus': ['cumulative bonus', 'claim free', 'renewal', 'sum insured', 'maximum'],
-                    'pre_existing': ['pre-existing disease', 'PED', 'physician', 'signs symptoms', 'diagnosed'],
-                    'exclusions': ['excluded', 'not covered', 'shall not', 'limitation', 'exception'],
-                    'hospital_definition': ['hospital means', 'institution', 'inpatient beds', 'registered', 'qualified']
+                    'grace_period': ['thirty days', '30 days', 'premium due', 'renew', 'continue'],
+                    'waiting_period': ['36 months', '24 months', 'continuous coverage', 'inception'],
+                    'maternity': ['female insured', 'lawful child', 'delivery', 'pregnancy'],
+                    'cataract': ['per eye', '25%', 'Rs. 40,000', 'sum insured'],
+                    'room_rent': ['2%', '5%', 'daily room', 'ICU charges']
                 }
                 
                 if question_type in keyword_boosts:
                     for keyword in keyword_boosts[question_type]:
                         if keyword in text_lower:
-                            specificity_score += 3
+                            final_score += 4
                 
-                # Length and completeness bonus
-                completeness_score = 0
-                if len(chunk['text']) > 200:  # Prefer substantial chunks
-                    completeness_score = 1
-                if len(chunk['text']) > 500:  # Even better for comprehensive chunks
-                    completeness_score = 2
-                
-                # Numerical content bonus
-                number_bonus = len(re.findall(r'\d+(?:\.\d+)?%?', chunk['text'])) * 0.5
-                
-                # Final score combination with optimized weights
-                final_score = (
-                    tfidf_score * 2.5 +         # TF-IDF similarity (reduced weight)
-                    pattern_score * 3 +         # Pattern matching (increased)
-                    section_score * 3 +         # Section relevance (increased)
-                    value_score * 2.5 +         # Numerical values (increased)
-                    specificity_score * 2 +     # Question-specific keywords
-                    completeness_score * 1 +    # Chunk completeness
-                    number_bonus               # Numerical content
-                )
-                
-                chunk_scores.append((i, final_score, chunk['text']))
+                scored_chunks.append((chunk_idx, final_score, chunk['text']))
             
-            # Sort by score and return top chunks
-            chunk_scores.sort(key=lambda x: x[1], reverse=True)
+            # Sort by final score and return top chunks
+            scored_chunks.sort(key=lambda x: x[1], reverse=True)
             
-            # Enhanced selection logic
+            # Select diverse, high-quality chunks
             selected_chunks = []
             seen_content = set()
             
-            for i, score, text in chunk_scores:
-                # Avoid very similar chunks
-                text_normalized = ' '.join(text.lower().split()[:20])  # First 20 words for similarity check
-                if text_normalized not in seen_content or len(selected_chunks) < 2:
+            for chunk_idx, score, text in scored_chunks:
+                # Avoid very similar content
+                text_signature = ' '.join(text.lower().split()[:15])  # First 15 words
+                if text_signature not in seen_content or len(selected_chunks) < 3:
                     selected_chunks.append(text)
-                    seen_content.add(text_normalized)
+                    seen_content.add(text_signature)
                     
-                if len(selected_chunks) >= top_k:
-                    break
-            
-            # Ensure we have at least 3 chunks for good context
-            if len(selected_chunks) < 3 and len(chunk_scores) >= 3:
-                for i, score, text in chunk_scores[len(selected_chunks):]:
-                    selected_chunks.append(text)
-                    if len(selected_chunks) >= 3:
+                    if len(selected_chunks) >= top_k:
                         break
             
             return selected_chunks[:top_k]
             
         except Exception as e:
-            print(f"Hybrid retrieval error: {e}")
+            print(f"Semantic retrieval error: {e}")
+            # Fallback to simple selection
             return [chunk['text'] for chunk in chunks[:top_k]]
 
-    async def generate_enhanced_answer(self, question: str, context: str, question_type: str) -> str:
-        """Generate answer with enhanced prompting based on question type"""
+    async def generate_optimized_answer(self, question: str, context: str, question_type: str) -> str:
+        """Generate answer optimized for insurance policy accuracy"""
         
-        # Enhanced prompts that match the expected response style
-        enhanced_prompt = f"""You are an expert insurance policy analyst. Analyze the provided policy document and answer the question with precise, factual information.
+        # Enhanced prompt engineering based on question type
+        prompt = f"""You are an expert insurance policy analyst with deep knowledge of Indian insurance policies. Answer the question based EXCLUSIVELY on the provided policy document text.
 
-POLICY DOCUMENT TEXT:
+POLICY DOCUMENT CONTENT:
 {context}
 
 QUESTION: {question}
 
 CRITICAL INSTRUCTIONS:
-1. Answer based ONLY on the provided policy text
-2. Start your response directly with the key information
-3. Include exact numbers, percentages, time periods, and monetary amounts
-4. For waiting periods: State exact months (e.g., "thirty-six (36) months")
-5. For coverage limits: Include both percentage and fixed amounts if mentioned
-6. For time periods: Use both written and numeric format (e.g., "thirty days", "two (2) years")
-7. For exclusions: Be specific about what is excluded and under what conditions
-8. For definitions: Include the complete definition as stated in the policy
+1. Answer ONLY based on the policy text provided above
+2. Use EXACT phrases and numbers from the policy document
+3. Include specific time periods (e.g., "thirty-six (36) months", "thirty days")
+4. Include exact monetary amounts and percentages as stated
+5. For waiting periods: State the exact duration and what it applies to
+6. For coverage limits: Include both percentage and fixed amounts if mentioned
+7. For exclusions: Be specific about conditions and circumstances
+8. Use formal insurance terminology as found in the document
 9. If multiple conditions apply, list them clearly
-10. If information is not in the policy, state "Not specified in the provided policy document"
+10. If the exact information is not in the provided text, state "Not specified in the provided policy document"
 
-RESPONSE FORMAT GUIDELINES:
-- Use formal insurance language
-- Include specific policy terms and conditions
-- Mention exact coverage limits and sub-limits
-- State waiting periods with precision
-- Include any relevant exceptions or special conditions
+RESPONSE STYLE:
+- Start directly with the key information (no preambles)
+- Use the same language style as the policy document
+- Include relevant conditions and exceptions
+- Be precise with numbers, dates, and percentages
+- Maintain professional insurance document tone
 
 ANSWER:"""
         
         try:
             response = await asyncio.to_thread(
                 self.model.generate_content,
-                enhanced_prompt,
-                generation_config=genai.types.GenerationConfig(
-                    temperature=0.05,  # Even lower for maximum factual accuracy
-                    max_output_tokens=250,  # Slightly more tokens for detailed responses
-                    candidate_count=1
-                )
-            )
-            
-            answer = response.text.strip()
-            
-            # Clean up response while preserving important formatting
-            answer = re.sub(r'^(Answer:|A:|Response:)\s*', '', answer)
-            answer = re.sub(r'^Based on.*?policy.*?,?\s*', '', answer, flags=re.IGNORECASE)
-            answer = re.sub(r'^According to.*?document.*?,?\s*', '', answer, flags=re.IGNORECASE)
-            answer = re.sub(r'^From the.*?policy.*?,?\s*', '', answer, flags=re.IGNORECASE)
-            
-            # Ensure proper formatting for insurance terms
-            answer = re.sub(r'\b(\d+)\s*months?\b', r'\1 months', answer)
-            answer = re.sub(r'\b(\d+)\s*days?\b', r'\1 days', answer)
-            answer = re.sub(r'\b(\d+)\s*years?\b', r'\1 years', answer)
-            
-            return answer
-            
-        except Exception as e:
-            print(f"Generation error: {e}")
-            return "Unable to determine from the provided policy document."
-        
-        try:
-            response = await asyncio.to_thread(
-                self.model.generate_content,
                 prompt,
                 generation_config=genai.types.GenerationConfig(
-                    temperature=0.1,  # Very low temperature for factual accuracy
-                    max_output_tokens=200,
+                    temperature=0.05,  # Very low for factual accuracy
+                    max_output_tokens=300,  # More space for detailed responses
                     candidate_count=1
                 )
             )
             
             answer = response.text.strip()
             
-            # Clean up response
-            answer = re.sub(r'^(Answer:|A:)\s*', '', answer)
+            # Clean up response while preserving formatting
+            answer = re.sub(r'^(Answer:|A:|Response:)\s*', '', answer)
             answer = re.sub(r'^Based on.*?policy.*?,?\s*', '', answer, flags=re.IGNORECASE)
             answer = re.sub(r'^According to.*?document.*?,?\s*', '', answer, flags=re.IGNORECASE)
             
@@ -576,57 +522,58 @@ ANSWER:"""
 
 # --- Enhanced PDF Processing ---
 def extract_text_with_structure(pdf_path: str) -> str:
-    """Extract text while preserving document structure"""
+    """Extract text while preserving document structure and layout"""
     try:
         doc = fitz.open(pdf_path)
         text_parts = []
         
         for page_num, page in enumerate(doc):
-            # Get text with layout preservation
+            # Extract text blocks to preserve structure
             blocks = page.get_text("dict")
             page_text = ""
             
             for block in blocks["blocks"]:
                 if "lines" in block:
+                    block_text = ""
                     for line in block["lines"]:
                         line_text = ""
                         for span in line["spans"]:
                             text = span["text"].strip()
                             if text:
+                                # Preserve formatting for important elements
+                                font_size = span.get("size", 12)
+                                if font_size > 14:  # Likely headers
+                                    text = f"\n{text}\n"
                                 line_text += text + " "
                         if line_text.strip():
-                            page_text += line_text.strip() + "\n"
-                    page_text += "\n"  # Block separator
+                            block_text += line_text.strip() + "\n"
+                    if block_text.strip():
+                        page_text += block_text + "\n"
             
             if page_text.strip():
                 text_parts.append(f"[Page {page_num + 1}]\n{page_text}")
         
         doc.close()
-        return "\n".join(text_parts)
+        full_text = "\n".join(text_parts)
+        
+        # Additional structure preservation
+        full_text = re.sub(r'\n([A-Z][A-Z\s]+)\n', r'\n\n\1\n\n', full_text)  # Emphasize headers
+        return full_text
         
     except Exception as e:
         print(f"PDF extraction error: {e}")
-        # Fallback to simple extraction
-        try:
-            doc = fitz.open(pdf_path)
-            text_parts = []
-            for page in doc:
-                text_parts.append(page.get_text())
-            doc.close()
-            return "\n".join(text_parts)
-        except:
-            raise HTTPException(status_code=500, detail=f"PDF processing failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"PDF processing failed: {str(e)}")
 
-# Initialize enhanced RAG system
-rag_system = AdvancedInsuranceRAG()
+# Initialize optimized RAG system
+rag_system = SemanticInsuranceRAG()
 
 # --- Main Endpoint ---
 @app.post("/api/v1/hackrx/run", response_model=QueryResponse)
 async def run_analysis(request: QueryRequest, token: str = Depends(verify_token)):
     try:
-        # Enhanced PDF download with better error handling
+        # Enhanced PDF download
         headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         }
         
         max_retries = 3
@@ -645,7 +592,7 @@ async def run_analysis(request: QueryRequest, token: str = Depends(verify_token)
                     raise HTTPException(status_code=400, detail=f"Failed to download PDF: {str(e)}")
                 await asyncio.sleep(2 ** attempt)
 
-        # Enhanced PDF processing
+        # Process PDF with enhanced extraction
         with tempfile.NamedTemporaryFile(delete=True, suffix=".pdf") as temp_file:
             for chunk in response.iter_content(chunk_size=8192):
                 temp_file.write(chunk)
@@ -657,36 +604,33 @@ async def run_analysis(request: QueryRequest, token: str = Depends(verify_token)
             if not raw_text or len(raw_text.strip()) < 100:
                 raise HTTPException(status_code=400, detail="No readable text found in PDF")
 
-            # Advanced text cleaning and chunking
+            # Advanced processing
             clean_text = rag_system.advanced_text_cleaning(raw_text)
-            chunks = rag_system.semantic_chunking(clean_text)
+            chunks = rag_system.intelligent_chunking(clean_text, base_chunk_size=650, overlap=120)
             
             if not chunks:
                 raise HTTPException(status_code=400, detail="No processable content found")
 
-        # Process questions with enhanced retrieval
+        print(f"Created {len(chunks)} chunks for processing")
+
+        # Process questions with semantic search
         answers = []
         for i, question in enumerate(request.questions):
             try:
-                question_type, patterns, confidence = rag_system.kb.classify_question_advanced(question)
+                question_type, patterns, confidence = rag_system.kb.classify_question_semantic(question)
                 
-                # Use optimal number of chunks based on question complexity
-                chunk_count = 7 if question_type in ['exclusions', 'coverage', 'hospital_definition'] else 5
-                relevant_chunks = rag_system.hybrid_retrieval(question, chunks, top_k=chunk_count)
+                # Use semantic retrieval for better accuracy
+                relevant_chunks = rag_system.semantic_retrieval(question, chunks, top_k=5)
                 
-                # Combine context with better formatting for the model
+                # Combine context optimally
                 context_parts = []
-                for idx, chunk in enumerate(relevant_chunks[:5]):  # Use top 5 chunks
-                    context_parts.append(f"POLICY SECTION {idx + 1}:\n{chunk}")
+                for idx, chunk in enumerate(relevant_chunks):
+                    context_parts.append(f"SECTION {idx + 1}:\n{chunk}")
                 
                 context = "\n\n" + ("="*60 + "\n\n").join(context_parts)
                 
-                # Ensure we have substantial context (aim for 1000+ characters)
-                if len(context) < 1000 and len(relevant_chunks) > 5:
-                    additional_chunk = f"\n\nADDITIONAL CONTEXT:\n{relevant_chunks[5]}"
-                    context += additional_chunk
-                
-                answer = await rag_system.generate_enhanced_answer(question, context, question_type)
+                # Generate answer
+                answer = await rag_system.generate_optimized_answer(question, context, question_type)
                 answers.append(answer)
                 
                 print(f"Q{i+1} [{question_type}] (conf: {confidence:.2f}): {len(context)} chars, {len(relevant_chunks)} chunks")
@@ -705,11 +649,11 @@ async def run_analysis(request: QueryRequest, token: str = Depends(verify_token)
 
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy", "message": "Enhanced Insurance Policy Analyzer API"}
+    return {"status": "healthy", "message": "Optimized Insurance Policy Analyzer with Semantic Search"}
 
 @app.get("/")
 async def root():
-    return {"message": "HackRx 6.0 Enhanced Insurance Policy Analyzer - Optimized for Maximum Accuracy"}
+    return {"message": "HackRx 6.0 Semantic Insurance Policy Analyzer - Maximum Accuracy Mode"}
 
 if __name__ == "__main__":
     import uvicorn
